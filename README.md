@@ -52,22 +52,35 @@ ghnotify send --repo GitHub.Issues --prompt "What's the status of PR #123?"
 # → tmux session "claude-GitHub-Issues" receives the prompt and Claude responds.
 ```
 
-### Run the webhook receiver
+### Run the all-in-one daemon
 
 ```bash
-ghnotify serve   # listens on 127.0.0.1:9877
+ghnotify watch                                     # auto-discover repos
+ghnotify watch --repo owner/foo --repo owner/bar   # explicit list
 ```
 
-Point a `gh webhook forward` (or any GitHub webhook destination) at
-`http://127.0.0.1:9877/webhook`. ghnotify reads `repository.name` from the
-payload and dispatches to `claude-<name>`.
+`watch` is the recommended way to run ghnotify. In a single process it:
+
+1. Cleans up any zombie forwarder hooks on each target repo.
+2. Spawns one `gh webhook forward` subprocess per repo (so GitHub can reach you).
+3. Runs the local HTTP receiver and dispatches incoming events to the matching
+   `claude-<repo>` tmux session via `tmux send-keys`.
+
+Auto-discovery walks `/proc` for running `claude` processes and reads each
+one's git remote — Linux only. On macOS/Windows pass `--repo` explicitly.
+`gh` must be on `PATH` and authenticated (`gh auth status`).
+
+Defaults to forwarding `pull_request_review,check_suite,workflow_run`. Override
+with `--events '*'` for everything, or any comma-separated subset.
+
+### Lower-level: receiver only
 
 ```bash
-gh webhook forward \
-    --repo Olbrasoft/GitHub.Issues \
-    --events '*' \
-    --url http://127.0.0.1:9877/webhook
+ghnotify serve   # listens on 127.0.0.1:9877, no gh subprocess
 ```
+
+Use this when you already manage `gh webhook forward` (or another webhook
+source) yourself. Point it at `http://127.0.0.1:9877/webhook`.
 
 ## Config
 
@@ -89,8 +102,11 @@ MVP — basic plumbing works. Roadmap:
 
 - [x] `ghnotify install` subcommand: writes the `claude()` wrapper into
       `~/.bashrc` / `~/.zshrc` between managed markers.
-- [ ] Embed `gh webhook forward` so a single `ghnotify watch` process handles
-      both the GitHub relay and the tmux dispatch (no separate daemon needed).
+- [x] `ghnotify watch`: spawns `gh webhook forward` per repo *and* runs the
+      receiver in one process. Auto-discovers repos from active `claude`
+      processes (Linux); pass `--repo` on other platforms.
+- [ ] Native WebSocket relay client to drop `gh` as a runtime dep (today
+      `watch` shells out to `gh webhook forward`).
 - [ ] Per-event-type prompt templates (CI failure → "fix it", review done →
       "address comments").
 - [ ] Pre-built binaries on Releases for Linux/macOS/Windows.

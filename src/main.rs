@@ -4,9 +4,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod config;
+mod discover;
 mod install;
 mod sessions;
 mod tmux;
+mod watch;
 mod webhook;
 
 #[derive(Parser)]
@@ -66,6 +68,24 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// One-process mode: spawn `gh webhook forward` per repo AND run the
+    /// local HTTP receiver in the same binary. Use this instead of running
+    /// `serve` plus a separate gh forwarder.
+    Watch {
+        /// GitHub repo `owner/name` to subscribe to. Repeatable. If omitted,
+        /// auto-discovers from running `claude` processes (Linux only).
+        #[arg(long)]
+        repo: Vec<String>,
+
+        /// GitHub event types to subscribe to (comma-separated, no spaces).
+        #[arg(long, default_value = watch::DEFAULT_EVENTS)]
+        events: String,
+
+        /// Bind address override for the local receiver. Defaults to config.
+        #[arg(long, env = "GHNOTIFY_BIND")]
+        bind: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -109,6 +129,10 @@ async fn main() -> Result<()> {
             };
             let rc_path = install::resolve_rc_path(rc, shell)?;
             install::run(rc_path, dry_run).map(|_| ())
+        }
+        Command::Watch { repo, events, bind } => {
+            let cfg = config::load(cli.config.as_deref())?;
+            watch::run(cfg, repo, events, bind).await
         }
     }
 }
