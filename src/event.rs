@@ -21,8 +21,15 @@ pub enum Decision {
 /// Exactly-shaped test for GitHub's PR-synthetic check_suite refs:
 /// `refs/pull/<digits>/head` or `refs/pull/<digits>/merge`. A plain prefix
 /// match on `refs/pull/` would over-match any user-authored branch
-/// happening to share that prefix; the stricter shape makes the filter
-/// unambiguous with no false positives.
+/// happening to share that prefix; the stricter shape avoids that over-
+/// match and rules out the obvious lookalikes (`refs/pulls/…`,
+/// `refs/pull/4/patch`, non-numeric segment, extra trailing path). A
+/// user who deliberately names a branch exactly
+/// `refs/pull/<digits>/(head|merge)` would still be suppressed — that
+/// collision is accepted as the cost of deduplicating the paired wake
+/// for the overwhelmingly common case. The check_suite payload carries
+/// no field that would distinguish a user's branch-push from GitHub's
+/// synthetic-ref dispatch once the shape matches.
 fn is_refs_pull_synthetic(head_branch: &str) -> bool {
     let Some(rest) = head_branch.strip_prefix("refs/pull/") else {
         return false;
