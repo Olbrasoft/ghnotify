@@ -332,6 +332,57 @@ mod tests {
     }
 
     #[test]
+    fn pr_review_dismissed_is_dropped() {
+        let d = classify(
+            "pull_request_review",
+            &json!({"action": "dismissed"}),
+            "x",
+            &[],
+        );
+        assert!(matches!(d, Decision::Drop { .. }));
+    }
+
+    #[test]
+    fn pr_review_submitted_approved_is_forwarded() {
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "human-reviewer"}, "state": "approved"},
+            "pull_request": {"number": 42},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        assert_eq!(
+            forward(&d),
+            Some("ghnotify code-review-complete: repo=cr pr=42 reviewer=human-reviewer state=approved"),
+        );
+    }
+
+    #[test]
+    fn pr_review_submitted_changes_requested_is_forwarded() {
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "strict-reviewer"}, "state": "changes_requested"},
+            "pull_request": {"number": 7},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        assert_eq!(
+            forward(&d),
+            Some("ghnotify code-review-complete: repo=cr pr=7 reviewer=strict-reviewer state=changes_requested"),
+        );
+    }
+
+    #[test]
+    fn pr_review_submitted_with_missing_fields_uses_fallbacks() {
+        // Robustness: malformed payload must not panic and must still forward
+        // a usable prompt with "?" sentinels.
+        let payload = json!({"action": "submitted"});
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        assert_eq!(
+            forward(&d),
+            Some("ghnotify code-review-complete: repo=cr pr=? reviewer=? state=?"),
+        );
+    }
+
+    #[test]
     fn all_pull_request_actions_are_dropped() {
         // Every pull_request action — opened, closed, reopened, synchronize,
         // ready_for_review, labeled, edited — is non-actionable on its own.
