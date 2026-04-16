@@ -33,6 +33,15 @@ pub struct Github {
     /// Optional shared HMAC secret for GitHub webhook signature verification (X-Hub-Signature-256).
     /// If unset, signatures are NOT verified — only acceptable for `gh webhook forward`-style local relay.
     pub webhook_secret: Option<String>,
+
+    /// Logins whose actions should NOT wake your Claude session — typically
+    /// your own GitHub username plus any bots that act on your behalf
+    /// (`github-actions[bot]`, `claude[bot]`, etc.). When the webhook payload
+    /// has `sender.login` matching any entry, the event is dropped.
+    ///
+    /// Example: `own_logins = ["jirka", "github-actions[bot]", "claude[bot]"]`
+    #[serde(default)]
+    pub own_logins: Vec<String>,
 }
 
 pub fn load(explicit: Option<&Path>) -> Result<Config> {

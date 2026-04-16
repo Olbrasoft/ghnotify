@@ -19,7 +19,9 @@ pub enum Decision {
 }
 
 /// Classify a parsed webhook payload. `event_type` is the value of the
-/// `X-GitHub-Event` header; `repo` is the bare repo name (no owner).
+/// `X-GitHub-Event` header; `repo` is the bare repo name (no owner);
+/// `own_logins` is the list of GitHub logins whose actions should be
+/// dropped (your own username + bots that act on your behalf).
 ///
 /// Forwarding rules in plain language:
 ///   * `check_suite` is the *aggregate* of every workflow that ran for a
@@ -32,18 +34,40 @@ pub enum Decision {
 ///   * `pull_request` is forwarded on `opened`/`closed`/`reopened`/
 ///     `ready_for_review` — these are user-facing state changes, not the
 ///     dozens of `synchronize`/`labeled`/`assigned` updates.
-///   * `issues` and `issue_comment` are forwarded on creation; later edits
-///     are dropped.
+///   * `issues` is forwarded on `opened`/`closed`/`reopened`/`assigned`.
+///   * `issue_comment` is forwarded only when the body mentions `@claude-cr`
+///     or starts with `/claude` (slash-command trigger) — normal issue chat
+///     is noise.
 ///   * `push` is dropped (way too frequent on busy repos; CI completion is
 ///     covered by check_suite).
 ///   * `ping` is forwarded as a sentinel so we can confirm hook creation.
 ///   * Anything else is dropped — better to silently miss a new event type
 ///     than to leak random noise into the prompt.
-pub fn classify(event_type: &str, payload: &Value, repo: &str) -> Decision {
+///
+/// Self-skip: if `payload.sender.login` is in `own_logins`, the event is
+/// dropped regardless of type. This prevents waking the session for actions
+/// it (or its bots) just took itself.
+pub fn classify(
+    event_type: &str,
+    payload: &Value,
+    repo: &str,
+    own_logins: &[String],
+) -> Decision {
     let action = payload
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("");
+
+    // Self-author skip: don't wake for events this user (or one of their
+    // bots) caused. Note that `ping` events have no sender; the unwrap_or("")
+    // means they fall through to the normal classifier.
+    if let Some(sender) = payload.pointer("/sender/login").and_then(Value::as_str) {
+        if own_logins.iter().any(|own| own == sender) {
+            return Decision::Drop {
+                reason: "self-authored event (sender in own_logins)",
+            };
+        }
+    }
 
     match event_type {
         "ping" => Decision::Forward {
@@ -59,6 +83,10 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str) -> Decision {
                 .pointer("/check_suite/head_sha")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let head_branch = payload
+                .pointer("/check_suite/head_branch")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             let prs: Vec<String> = payload
                 .pointer("/check_suite/pull_requests")
                 .and_then(Value::as_array)
@@ -74,7 +102,7 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str) -> Decision {
             let head_short = head_sha.get(..8).unwrap_or(head_sha);
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify ci-complete: repo={repo} status={conclusion} pr={pr_str} head={head_short}"
+                    "ghnotify ci-complete: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}"
                 ),
             }
         }
@@ -148,6 +176,23 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str) -> Decision {
         },
 
         "issue_comment" if action == "created" => {
+            let body = payload
+                .pointer("/comment/body")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Wake only when explicitly addressed: @claude-cr mention or a
+            // /claude slash-command on its own line. Otherwise normal issue
+            // chat would wake the session every few seconds on busy repos.
+            let mentioned = body.contains("@claude-cr")
+                || body.contains("@claude")
+                || body
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("/claude"));
+            if !mentioned {
+                return Decision::Drop {
+                    reason: "issue_comment without @claude / /claude trigger",
+                };
+            }
             let n = payload
                 .pointer("/issue/number")
                 .and_then(Value::as_u64)
@@ -158,7 +203,7 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str) -> Decision {
                 .and_then(Value::as_str)
                 .unwrap_or("?");
             Decision::Forward {
-                prompt: format!("ghnotify issue_comment: repo={repo} issue={n} author={author}"),
+                prompt: format!("ghnotify issue_comment: repo={repo} issue={n} author={author} (you were mentioned)"),
             }
         }
         "issue_comment" => Decision::Drop {
@@ -192,25 +237,25 @@ mod tests {
 
     #[test]
     fn ping_is_forwarded() {
-        let d = classify("ping", &json!({}), "GitHub.Issues");
+        let d = classify("ping", &json!({}), "GitHub.Issues", &[]);
         assert_eq!(forward(&d), Some("ghnotify: ping repo=GitHub.Issues"));
     }
 
     #[test]
     fn workflow_run_is_dropped() {
-        let d = classify("workflow_run", &json!({"action": "completed"}), "cr");
+        let d = classify("workflow_run", &json!({"action": "completed"}), "cr", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
     fn check_run_is_dropped() {
-        let d = classify("check_run", &json!({"action": "completed"}), "cr");
+        let d = classify("check_run", &json!({"action": "completed"}), "cr", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
     fn check_suite_in_progress_is_dropped() {
-        let d = classify("check_suite", &json!({"action": "in_progress"}), "cr");
+        let d = classify("check_suite", &json!({"action": "in_progress"}), "cr", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
@@ -221,13 +266,14 @@ mod tests {
             "check_suite": {
                 "conclusion": "success",
                 "head_sha": "abc12345deadbeef",
+                "head_branch": "feat/foo",
                 "pull_requests": [{"number": 476}, {"number": 477}],
             },
         });
-        let d = classify("check_suite", &payload, "cr");
+        let d = classify("check_suite", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify ci-complete: repo=cr status=success pr=476,477 head=abc12345"),
+            Some("ghnotify ci-complete: repo=cr status=success pr=476,477 branch=feat/foo head=abc12345"),
         );
     }
 
@@ -238,13 +284,14 @@ mod tests {
             "check_suite": {
                 "conclusion": "failure",
                 "head_sha": "deadbeef",
+                "head_branch": "main",
                 "pull_requests": [],
             },
         });
-        let d = classify("check_suite", &payload, "cr");
+        let d = classify("check_suite", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify ci-complete: repo=cr status=failure pr=none head=deadbeef"),
+            Some("ghnotify ci-complete: repo=cr status=failure pr=none branch=main head=deadbeef"),
         );
     }
 
@@ -255,7 +302,7 @@ mod tests {
             "review": {"user": {"login": "copilot[bot]"}, "state": "commented"},
             "pull_request": {"number": 123},
         });
-        let d = classify("pull_request_review", &payload, "GitHub.Issues");
+        let d = classify("pull_request_review", &payload, "GitHub.Issues", &[]);
         assert_eq!(
             forward(&d),
             Some("ghnotify code-review-complete: repo=GitHub.Issues pr=123 reviewer=copilot[bot] state=commented"),
@@ -264,19 +311,20 @@ mod tests {
 
     #[test]
     fn pr_review_edited_is_dropped() {
-        let d = classify("pull_request_review", &json!({"action": "edited"}), "x");
+        let d = classify("pull_request_review", &json!({"action": "edited"}), "x", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
     fn pr_synchronize_is_dropped_pr_opened_is_forwarded() {
-        let sync = classify("pull_request", &json!({"action": "synchronize"}), "x");
+        let sync = classify("pull_request", &json!({"action": "synchronize"}), "x", &[]);
         assert!(matches!(sync, Decision::Drop { .. }));
 
         let opened = classify(
             "pull_request",
             &json!({"action": "opened", "pull_request": {"number": 99, "merged": false}}),
             "x",
+            &[],
         );
         assert_eq!(
             forward(&opened),
@@ -286,13 +334,78 @@ mod tests {
 
     #[test]
     fn push_is_dropped() {
-        let d = classify("push", &json!({}), "x");
+        let d = classify("push", &json!({}), "x", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
     fn unknown_event_is_dropped() {
-        let d = classify("totally_made_up", &json!({}), "x");
+        let d = classify("totally_made_up", &json!({}), "x", &[]);
         assert!(matches!(d, Decision::Drop { .. }));
+    }
+
+    #[test]
+    fn self_authored_event_is_dropped() {
+        let payload = json!({
+            "action": "submitted",
+            "sender": {"login": "github-actions[bot]"},
+            "review": {"user": {"login": "human-reviewer"}, "state": "approved"},
+            "pull_request": {"number": 1},
+        });
+        let own = vec!["jirka".to_string(), "github-actions[bot]".to_string()];
+        let d = classify("pull_request_review", &payload, "x", &own);
+        assert!(matches!(d, Decision::Drop { .. }));
+    }
+
+    #[test]
+    fn other_authored_event_passes_self_skip() {
+        let payload = json!({
+            "action": "submitted",
+            "sender": {"login": "copilot[bot]"},
+            "review": {"user": {"login": "copilot[bot]"}, "state": "commented"},
+            "pull_request": {"number": 1},
+        });
+        let own = vec!["jirka".to_string()];
+        let d = classify("pull_request_review", &payload, "x", &own);
+        assert!(matches!(d, Decision::Forward { .. }));
+    }
+
+    #[test]
+    fn issue_comment_without_mention_is_dropped() {
+        let payload = json!({
+            "action": "created",
+            "comment": {"body": "Just chatting normally", "user": {"login": "alice"}},
+            "issue": {"number": 5},
+        });
+        assert!(matches!(
+            classify("issue_comment", &payload, "x", &[]),
+            Decision::Drop { .. }
+        ));
+    }
+
+    #[test]
+    fn issue_comment_with_at_claude_is_forwarded() {
+        let payload = json!({
+            "action": "created",
+            "comment": {"body": "Hey @claude-cr please look at this", "user": {"login": "alice"}},
+            "issue": {"number": 5},
+        });
+        assert!(matches!(
+            classify("issue_comment", &payload, "x", &[]),
+            Decision::Forward { .. }
+        ));
+    }
+
+    #[test]
+    fn issue_comment_with_slash_claude_is_forwarded() {
+        let payload = json!({
+            "action": "created",
+            "comment": {"body": "/claude do the thing", "user": {"login": "alice"}},
+            "issue": {"number": 5},
+        });
+        assert!(matches!(
+            classify("issue_comment", &payload, "x", &[]),
+            Decision::Forward { .. }
+        ));
     }
 }

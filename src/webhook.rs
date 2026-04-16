@@ -85,7 +85,12 @@ async fn handle_webhook(
     };
 
     // 3. Classify: should we forward this event at all, and as what prompt?
-    let prompt = match event::classify(event_type, &payload, repo_name) {
+    let prompt = match event::classify(
+        event_type,
+        &payload,
+        repo_name,
+        &state.cfg.github.own_logins,
+    ) {
         event::Decision::Forward { prompt } => prompt,
         event::Decision::Drop { reason } => {
             info!(event_type, repo = repo_name, reason, "event dropped by filter");
