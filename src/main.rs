@@ -4,12 +4,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod config;
-mod discover;
 mod event;
 mod install;
+mod install_hook;
 mod sessions;
 mod tmux;
-mod watch;
 mod webhook;
 
 #[derive(Parser)]
@@ -35,10 +34,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the HTTP webhook receiver. Routes GitHub events to tmux sessions.
+    ///
+    /// Picks a listening socket in this order:
+    ///   1. systemd socket activation (LISTEN_FDS env)
+    ///   2. --bind override
+    ///   3. config `server.bind` (default 127.0.0.1:9877)
     Serve {
-        /// Bind address. Defaults to 127.0.0.1:9877.
+        /// Bind address. Ignored when a systemd socket is passed.
         #[arg(long, env = "GHNOTIFY_BIND")]
         bind: Option<String>,
+
+        /// Exit after serving exactly one request. Intended to be paired with
+        /// systemd socket activation so nothing is running between webhooks.
+        #[arg(long)]
+        one_shot: bool,
     },
 
     /// Send a one-shot prompt to a Claude tmux session by repo name.
@@ -75,22 +84,33 @@ enum Command {
         dry_run: bool,
     },
 
-    /// One-process mode: spawn `gh webhook forward` per repo AND run the
-    /// local HTTP receiver in the same binary. Use this instead of running
-    /// `serve` plus a separate gh forwarder.
-    Watch {
-        /// GitHub repo `owner/name` to subscribe to. Repeatable. If omitted,
-        /// auto-discovers from running `claude` processes (Linux only).
+    /// Register (or update) a GitHub webhook that will POST events to the
+    /// given public URL. Supports both repository-scoped (`--repo OWNER/NAME`,
+    /// needs `admin:repo_hook`) and org-scoped (`--org NAME`, needs
+    /// `admin:org_hook`) hooks. An org hook fires for every current and future
+    /// repo in the org — prefer it over per-repo hooks when you own the org.
+    /// Note: personal user accounts cannot host webhooks that cover all their
+    /// repos; use a GitHub App for that case.
+    InstallHook {
+        /// Target repository, e.g. `Olbrasoft/ghnotify`. Repeatable.
         #[arg(long)]
         repo: Vec<String>,
 
-        /// GitHub event types to subscribe to (comma-separated, no spaces).
-        #[arg(long, default_value = watch::DEFAULT_EVENTS)]
-        events: String,
+        /// Target organization. Repeatable. Mutually combinable with --repo.
+        #[arg(long)]
+        org: Vec<String>,
 
-        /// Bind address override for the local receiver. Defaults to config.
-        #[arg(long, env = "GHNOTIFY_BIND")]
-        bind: Option<String>,
+        /// Public URL GitHub should POST to (e.g. https://tunnel.example.com/gh-webhook).
+        #[arg(long)]
+        url: String,
+
+        /// HMAC shared secret. If omitted, reads `github.webhook_secret` from config.
+        #[arg(long)]
+        secret: Option<String>,
+
+        /// Event types to subscribe to (comma-separated).
+        #[arg(long, default_value = "check_suite,pull_request_review,pull_request,issues,issue_comment")]
+        events: String,
     },
 }
 
@@ -104,9 +124,9 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Command::Serve { bind } => {
+        Command::Serve { bind, one_shot } => {
             let cfg = config::load(cli.config.as_deref())?;
-            webhook::serve(cfg, bind).await
+            webhook::serve(cfg, bind, one_shot).await
         }
         Command::Send { repo, prompt } => {
             let session = tmux::session_name_for_repo(&repo);
@@ -136,9 +156,22 @@ async fn main() -> Result<()> {
             let rc_path = install::resolve_rc_path(rc, shell)?;
             install::run(rc_path, dry_run).map(|_| ())
         }
-        Command::Watch { repo, events, bind } => {
+        Command::InstallHook {
+            repo,
+            org,
+            url,
+            secret,
+            events,
+        } => {
+            if repo.is_empty() && org.is_empty() {
+                anyhow::bail!("at least one --repo or --org is required");
+            }
             let cfg = config::load(cli.config.as_deref())?;
-            watch::run(cfg, repo, events, bind).await
+            let secret = secret.or(cfg.github.webhook_secret);
+            let mut scopes: Vec<install_hook::Scope> = Vec::new();
+            scopes.extend(repo.into_iter().map(install_hook::Scope::Repo));
+            scopes.extend(org.into_iter().map(install_hook::Scope::Org));
+            install_hook::run(scopes, &url, secret.as_deref(), &events).await
         }
     }
 }

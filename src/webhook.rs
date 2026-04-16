@@ -3,9 +3,15 @@
 //!
 //! GitHub event payload shape (subset we care about):
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
+//!
+//! Runs in two modes:
+//!   * persistent — binds an address and serves forever (`ghnotify serve`)
+//!   * one-shot   — serves exactly one request then exits (`ghnotify serve --one-shot`),
+//!     intended to be run per-connection under systemd socket activation so
+//!     nothing is running between webhook deliveries.
 
 use crate::{config::Config, event, tmux};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::State,
@@ -14,30 +20,80 @@ use axum::{
     Json, Router,
 };
 use hmac::{Hmac, Mac};
+use listenfd::ListenFd;
 use sha2::Sha256;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
+    /// If set, the request handler fires this sender once a response is
+    /// produced so the axum serve loop can shut down after one request.
+    shutdown_once: Option<Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>>,
 }
 
-pub async fn serve(cfg: Config, bind_override: Option<String>) -> Result<()> {
-    let bind = bind_override.unwrap_or_else(|| cfg.server.bind.clone());
-    let state = AppState { cfg: Arc::new(cfg) };
+pub async fn serve(cfg: Config, bind_override: Option<String>, one_shot: bool) -> Result<()> {
+    let listener = acquire_listener(&cfg, bind_override.as_deref()).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        shutdown_once: if one_shot {
+            Some(Arc::new(Mutex::new(Some(shutdown_tx))))
+        } else {
+            None
+        },
+    };
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/webhook", post(handle_webhook))
         .with_state(state);
 
-    info!(bind = %bind, "ghnotify listening");
-
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, app).await?;
+    if one_shot {
+        info!("one-shot mode: will exit after one request");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await?;
+    } else {
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+/// Prefer a listening socket passed by the init system (systemd socket
+/// activation via `LISTEN_FDS`). Fall back to binding a TCP address.
+async fn acquire_listener(
+    cfg: &Config,
+    bind_override: Option<&str>,
+) -> Result<tokio::net::TcpListener> {
+    let mut lf = ListenFd::from_env();
+    if let Some(std_listener) = lf
+        .take_tcp_listener(0)
+        .context("reading systemd LISTEN_FDS")?
+    {
+        std_listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let local = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<systemd socket>".into());
+        info!(listener = %local, "ghnotify listening (socket-activated)");
+        return Ok(listener);
+    }
+    let bind = bind_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| cfg.server.bind.clone());
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("binding {bind}"))?;
+    info!(bind = %bind, "ghnotify listening");
+    Ok(listener)
 }
 
 async fn handle_webhook(
@@ -45,9 +101,24 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let result = process_webhook(&state, &headers, &body).await;
+    if let Some(once) = &state.shutdown_once {
+        let mut guard = once.lock().await;
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    result
+}
+
+async fn process_webhook(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
     // 1. Optional HMAC signature verification.
     if let Some(secret) = state.cfg.github.webhook_secret.as_deref() {
-        match verify_signature(secret, &headers, &body) {
+        match verify_signature(secret, headers, body) {
             Ok(()) => {}
             Err(reason) => {
                 warn!(reason, "rejecting webhook: bad signature");
@@ -60,7 +131,7 @@ async fn handle_webhook(
     }
 
     // 2. Parse payload as a generic JSON value (the classifier reads many fields).
-    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+    let payload: serde_json::Value = match serde_json::from_slice(body) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "webhook body is not valid JSON");
@@ -123,10 +194,9 @@ async fn handle_webhook(
                 Json(serde_json::json!({ "ok": true, "session": session })),
             )
         }
-        // No session for this repo → soft discard. Webhook senders (gh webhook
-        // forward, GitHub itself) do not retry on non-2xx anyway, but we return
-        // 200 so logs stay clean: there is nothing wrong, there is just no one
-        // home to wake up.
+        // No session for this repo → soft discard. Webhook senders do not
+        // retry on non-2xx anyway, but we return 200 so logs stay clean:
+        // there is nothing wrong, there is just no one home to wake up.
         Ok(tmux::Delivery::NoSession) => {
             info!(
                 session,
