@@ -18,6 +18,24 @@ pub enum Decision {
     Drop { reason: &'static str },
 }
 
+/// Exactly-shaped test for GitHub's PR-synthetic check_suite refs:
+/// `refs/pull/<digits>/head` or `refs/pull/<digits>/merge`. A plain prefix
+/// match on `refs/pull/` would over-match any user-authored branch
+/// happening to share that prefix; the stricter shape makes the filter
+/// unambiguous with no false positives.
+fn is_refs_pull_synthetic(head_branch: &str) -> bool {
+    let Some(rest) = head_branch.strip_prefix("refs/pull/") else {
+        return false;
+    };
+    let Some((num, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(tail, "head" | "merge")
+}
+
 /// Trim, sanitize, and truncate a review/comment body for inclusion in the
 /// wake prompt. Empty → empty string; otherwise returns ` body="<excerpt>"`.
 ///
@@ -149,7 +167,14 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
             // case that used to look like "a late duplicate wake arriving
             // after merge" — it's not late, it's just the second of the
             // pair completing.
-            if head_branch.starts_with("refs/pull/") {
+            //
+            // The predicate matches the exact shape
+            // `refs/pull/<digits>/(head|merge)` rather than a naive
+            // prefix check, so a hypothetical real branch whose name
+            // happens to start with `refs/pull/` (harmless but possible
+            // in user-authored refs namespaces) is not accidentally
+            // suppressed.
+            if is_refs_pull_synthetic(head_branch) {
                 return Decision::Drop {
                     reason: "check_suite on refs/pull/ synthetic ref (pair-dup of branch-named check_suite)",
                 };
@@ -817,6 +842,38 @@ mod tests {
                     Decision::Drop { .. }
                 ),
                 "refs/pull/ head_branch {head_branch} should be dropped",
+            );
+        }
+    }
+
+    #[test]
+    fn check_suite_refs_pull_lookalikes_are_not_dropped_by_synthetic_filter() {
+        // The filter must match the exact shape `refs/pull/<digits>/(head|merge)`
+        // — a plain `starts_with("refs/pull/")` would over-match any
+        // user-authored branch sharing the prefix. Legitimate (if unusual)
+        // branch names below must still reach the forward path.
+        for head_branch in [
+            "refs/pull/foo",           // no trailing /head or /merge
+            "refs/pull/foo/bar",       // non-numeric "number"
+            "refs/pull/4/patch",       // wrong tail segment
+            "refs/pull//head",         // empty number
+            "refs/pull/4/head/extra",  // trailing path component
+            "refs/pulls/4/head",       // wrong prefix spelling
+            "refs/pull-custom/4/head", // prefix not matching exactly
+        ] {
+            let payload = json!({
+                "action": "completed",
+                "check_suite": {
+                    "conclusion": "success",
+                    "head_sha": "abc12345",
+                    "head_branch": head_branch,
+                    "pull_requests": [],
+                },
+            });
+            let d = classify("check_suite", &payload, "ghnotify", &[]);
+            assert!(
+                matches!(d, Decision::Forward { .. }),
+                "lookalike {head_branch:?} should NOT be filtered as synthetic",
             );
         }
     }
