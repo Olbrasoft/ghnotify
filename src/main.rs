@@ -109,7 +109,10 @@ enum Command {
         secret: Option<String>,
 
         /// Event types to subscribe to (comma-separated).
-        #[arg(long, default_value = "check_suite,pull_request_review,pull_request,issues,issue_comment")]
+        #[arg(
+            long,
+            default_value = "check_suite,pull_request_review,pull_request,issues,issue_comment"
+        )]
         events: String,
     },
 }

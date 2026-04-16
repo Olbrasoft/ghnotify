@@ -98,9 +98,12 @@ async fn install_one(
     let body_str = serde_json::to_string(&body)?;
     match existing {
         Some(id) => {
-            gh_api(&["api", "-X", "PATCH", &scope.hook_path(id)], Some(&body_str))
-                .await
-                .with_context(|| format!("patching hook {id} on {}", scope.name()))?;
+            gh_api(
+                &["api", "-X", "PATCH", &scope.hook_path(id)],
+                Some(&body_str),
+            )
+            .await
+            .with_context(|| format!("patching hook {id} on {}", scope.name()))?;
             Ok("patched")
         }
         None => {
