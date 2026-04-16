@@ -20,61 +20,37 @@ pub enum Decision {
 
 /// Classify a parsed webhook payload. `event_type` is the value of the
 /// `X-GitHub-Event` header; `repo` is the bare repo name (no owner);
-/// `own_logins` is the list of GitHub logins whose actions should be
-/// dropped (your own username + bots that act on your behalf).
+/// `own_logins` is the list of GitHub logins representing "me" (your own
+/// username + bots that act on your behalf).
 ///
-/// Forwarding rules in plain language:
-///   * `check_suite` is the *aggregate* of every workflow that ran for a
-///     commit. We forward only the terminal `completed` action and call it
-///     `ci-complete` — that's the one wake the assistant should react to.
-///   * `workflow_run` and `check_run` are subordinate to check_suite and are
-///     dropped.
-///   * `pull_request_review` is forwarded only on `submitted` (the moment a
-///     review actually appears) — `edited`/`dismissed` are noise.
-///   * `pull_request` is forwarded on `opened`/`closed`/`reopened`/
-///     `ready_for_review` — these are user-facing state changes, not the
-///     dozens of `synchronize`/`labeled`/`assigned` updates.
-///   * `issues` is forwarded on `opened`/`closed`/`reopened`/`assigned`.
-///   * `issue_comment` is forwarded only when the body mentions `@claude-cr`
-///     or starts with `/claude` (slash-command trigger) — normal issue chat
-///     is noise.
-///   * `push` is dropped (way too frequent on busy repos; CI completion is
-///     covered by check_suite).
-///   * `ping` is forwarded as a sentinel so we can confirm hook creation.
-///   * Anything else is dropped — better to silently miss a new event type
-///     than to leak random noise into the prompt.
+/// **Design principle: wake only when an action is required.** Mere state
+/// changes (PR opened, PR merged, issue filed) do not trigger a wake — they
+/// become actionable only when CI or a reviewer concludes. Every forwarded
+/// event must answer "what do I do in response?" with a concrete verb.
 ///
-/// Self-skip: if `payload.sender.login` is in `own_logins`, the event is
-/// dropped regardless of type. This prevents waking the session for actions
-/// it (or its bots) just took itself.
-pub fn classify(
-    event_type: &str,
-    payload: &Value,
-    repo: &str,
-    own_logins: &[String],
-) -> Decision {
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    // Self-author skip applies ONLY to event types where "sender" semantically
-    // means "the human (or my bot) who deliberately performed this action and
-    // therefore already knows about it" — opening/closing a PR or issue.
-    //
-    // Critically NOT applied to check_suite / pull_request_review /
-    // issue_comment: on check_suite the `sender` field is the pusher of the
-    // commit that triggered CI, so suppressing those would silence the most
-    // important wake event of all — the result of CI on my own push.
-    if matches!(event_type, "pull_request" | "issues") {
-        if let Some(sender) = payload.pointer("/sender/login").and_then(Value::as_str) {
-            if own_logins.iter().any(|own| own == sender) {
-                return Decision::Drop {
-                    reason: "self-authored pull_request/issue (sender in own_logins)",
-                };
-            }
-        }
-    }
+/// Forwarding rules:
+///   * `check_suite completed` is the one reliable CI aggregate. Success →
+///     `ci-success` (decide whether to merge); failure/cancelled/timed_out →
+///     `ci-failure` (fix it). Non-terminal actions are dropped.
+///   * `pull_request_review submitted` → `code-review-complete` (read
+///     comments, address or merge). `edited`/`dismissed` are noise.
+///   * `issue_comment created` is forwarded only when the body mentions
+///     `@claude`/`@claude-cr` or starts with `/claude` — the explicit
+///     "please act" signal.
+///   * `issues assigned` is forwarded only when the assignee is in
+///     `own_logins`. Someone else's assignment is not my work.
+///   * `pull_request` is fully dropped — the wakes that matter are the
+///     downstream `check_suite` and `pull_request_review` events, not the
+///     state change itself. I know when *I* opened/merged a PR.
+///   * `issues opened/closed/reopened` is dropped — triage is not a wake-up
+///     task.
+///   * `workflow_run`/`check_run`/`push`/`status`/`deployment*` are dropped
+///     as subordinate or too-frequent.
+///   * `ping` is forwarded so hook creation is visible.
+///   * Anything else is dropped — silently miss a new event type rather than
+///     leak noise.
+pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[String]) -> Decision {
+    let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
 
     match event_type {
         "ping" => Decision::Forward {
@@ -100,16 +76,27 @@ pub fn classify(
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|pr| {
-                            pr.get("number").and_then(Value::as_u64).map(|n| n.to_string())
+                            pr.get("number")
+                                .and_then(Value::as_u64)
+                                .map(|n| n.to_string())
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            let pr_str = if prs.is_empty() { "none".into() } else { prs.join(",") };
+            let pr_str = if prs.is_empty() {
+                "none".into()
+            } else {
+                prs.join(",")
+            };
             let head_short = head_sha.get(..8).unwrap_or(head_sha);
+            let kind = if conclusion == "success" {
+                "ci-success"
+            } else {
+                "ci-failure"
+            };
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify ci-complete: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}"
+                    "ghnotify {kind}: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}"
                 ),
             }
         }
@@ -148,38 +135,40 @@ pub fn classify(
             reason: "review action != submitted",
         },
 
-        "pull_request"
-            if matches!(action, "opened" | "closed" | "reopened" | "ready_for_review") =>
-        {
-            let pr = payload
-                .pointer("/pull_request/number")
-                .and_then(Value::as_u64)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "?".into());
-            let merged = payload
-                .pointer("/pull_request/merged")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Decision::Forward {
-                prompt: format!("ghnotify pr: repo={repo} action={action} pr={pr} merged={merged}"),
-            }
-        }
+        // pull_request is informational only. All wake-ups related to a PR
+        // come from downstream events (check_suite, pull_request_review) or
+        // from explicit @claude mentions in comments. Knowing that a PR was
+        // opened/merged/synchronized is never on its own a call to action.
         "pull_request" => Decision::Drop {
-            reason: "pull_request action not interesting",
+            reason: "pull_request is informational; wakes come from check_suite/review",
         },
 
-        "issues" if matches!(action, "opened" | "closed" | "reopened" | "assigned") => {
+        // issues: only "someone just handed me this issue" is an immediate
+        // action trigger. Opening/closing/reopening an issue does not require
+        // the session to wake — that's what @claude mentions are for.
+        "issues" if action == "assigned" => {
+            let assignee = payload
+                .pointer("/assignee/login")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !own_logins.iter().any(|own| own == assignee) {
+                return Decision::Drop {
+                    reason: "issue assigned to someone else",
+                };
+            }
             let n = payload
                 .pointer("/issue/number")
                 .and_then(Value::as_u64)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
             Decision::Forward {
-                prompt: format!("ghnotify issue: repo={repo} action={action} issue={n}"),
+                prompt: format!(
+                    "ghnotify issue-assigned-to-me: repo={repo} issue={n} assignee={assignee}"
+                ),
             }
         }
         "issues" => Decision::Drop {
-            reason: "issue action not interesting",
+            reason: "issues action not actionable on its own",
         },
 
         "issue_comment" if action == "created" => {
@@ -192,9 +181,7 @@ pub fn classify(
             // chat would wake the session every few seconds on busy repos.
             let mentioned = body.contains("@claude-cr")
                 || body.contains("@claude")
-                || body
-                    .lines()
-                    .any(|l| l.trim_start().starts_with("/claude"));
+                || body.lines().any(|l| l.trim_start().starts_with("/claude"));
             if !mentioned {
                 return Decision::Drop {
                     reason: "issue_comment without @claude / /claude trigger",
@@ -267,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn check_suite_completed_is_forwarded_with_status_and_pr() {
+    fn check_suite_completed_success_is_forwarded_as_ci_success() {
         let payload = json!({
             "action": "completed",
             "check_suite": {
@@ -280,12 +267,12 @@ mod tests {
         let d = classify("check_suite", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify ci-complete: repo=cr status=success pr=476,477 branch=feat/foo head=abc12345"),
+            Some("ghnotify ci-success: repo=cr status=success pr=476,477 branch=feat/foo head=abc12345"),
         );
     }
 
     #[test]
-    fn check_suite_completed_no_pr_uses_none() {
+    fn check_suite_completed_failure_is_forwarded_as_ci_failure() {
         let payload = json!({
             "action": "completed",
             "check_suite": {
@@ -298,8 +285,25 @@ mod tests {
         let d = classify("check_suite", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify ci-complete: repo=cr status=failure pr=none branch=main head=deadbeef"),
+            Some("ghnotify ci-failure: repo=cr status=failure pr=none branch=main head=deadbeef"),
         );
+    }
+
+    #[test]
+    fn check_suite_completed_cancelled_is_ci_failure() {
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "cancelled",
+                "head_sha": "c0ffee0000",
+                "head_branch": "feat/x",
+                "pull_requests": [{"number": 1}],
+            },
+        });
+        let d = classify("check_suite", &payload, "cr", &[]);
+        // cancelled / timed_out / action_required all classify as ci-failure
+        // (something actionable went wrong).
+        assert!(forward(&d).unwrap().starts_with("ghnotify ci-failure:"));
     }
 
     #[test]
@@ -318,25 +322,59 @@ mod tests {
 
     #[test]
     fn pr_review_edited_is_dropped() {
-        let d = classify("pull_request_review", &json!({"action": "edited"}), "x", &[]);
+        let d = classify(
+            "pull_request_review",
+            &json!({"action": "edited"}),
+            "x",
+            &[],
+        );
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
-    fn pr_synchronize_is_dropped_pr_opened_is_forwarded() {
-        let sync = classify("pull_request", &json!({"action": "synchronize"}), "x", &[]);
-        assert!(matches!(sync, Decision::Drop { .. }));
+    fn all_pull_request_actions_are_dropped() {
+        // Every pull_request action — opened, closed, reopened, synchronize,
+        // ready_for_review, labeled, edited — is non-actionable on its own.
+        // Wakes come from the downstream check_suite and pull_request_review.
+        for action in [
+            "opened",
+            "closed",
+            "reopened",
+            "synchronize",
+            "ready_for_review",
+            "labeled",
+            "edited",
+            "assigned",
+        ] {
+            let payload = json!({
+                "action": action,
+                "pull_request": {"number": 99, "merged": false},
+                "sender": {"login": "someone-else"},
+            });
+            assert!(
+                matches!(
+                    classify("pull_request", &payload, "x", &[]),
+                    Decision::Drop { .. }
+                ),
+                "pull_request action '{action}' should be dropped",
+            );
+        }
+    }
 
-        let opened = classify(
-            "pull_request",
-            &json!({"action": "opened", "pull_request": {"number": 99, "merged": false}}),
-            "x",
-            &[],
-        );
-        assert_eq!(
-            forward(&opened),
-            Some("ghnotify pr: repo=x action=opened pr=99 merged=false"),
-        );
+    #[test]
+    fn pr_merged_by_self_is_dropped() {
+        // I just merged the PR myself → I know; the post-merge check_suite on
+        // main is the next wake that matters.
+        let payload = json!({
+            "action": "closed",
+            "pull_request": {"number": 99, "merged": true},
+            "sender": {"login": "Olbrasoft"},
+        });
+        let own = vec!["Olbrasoft".to_string()];
+        assert!(matches!(
+            classify("pull_request", &payload, "x", &own),
+            Decision::Drop { .. },
+        ));
     }
 
     #[test]
@@ -352,34 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn self_authored_pr_open_is_dropped() {
-        let payload = json!({
-            "action": "opened",
-            "sender": {"login": "Olbrasoft"},
-            "pull_request": {"number": 99, "merged": false},
-        });
-        let own = vec!["Olbrasoft".to_string()];
-        let d = classify("pull_request", &payload, "x", &own);
-        assert!(matches!(d, Decision::Drop { .. }));
-    }
-
-    #[test]
-    fn other_authored_pr_open_passes_self_skip() {
-        let payload = json!({
-            "action": "opened",
-            "sender": {"login": "copilot[bot]"},
-            "pull_request": {"number": 99, "merged": false},
-        });
-        let own = vec!["Olbrasoft".to_string()];
-        let d = classify("pull_request", &payload, "x", &own);
-        assert!(matches!(d, Decision::Forward { .. }));
-    }
-
-    #[test]
-    fn self_authored_check_suite_is_NOT_dropped() {
-        // Critical: ci-complete events MUST reach the session even though the
-        // pusher (= sender) is in own_logins. Otherwise the assistant never
-        // hears about CI results for its own pushes.
+    fn self_pushed_check_suite_is_forwarded() {
+        // Critical: CI results for *my own* pushes must reach the session,
+        // even though sender == own_logins. The classifier never drops
+        // check_suite on sender; this test locks that behavior in.
         let payload = json!({
             "action": "completed",
             "sender": {"login": "Olbrasoft"},
@@ -396,9 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn self_authored_pr_review_is_NOT_dropped() {
-        // Same reason: even if the review event arrives with sender=self for
-        // some payload reason, we want to know about reviews on my PRs.
+    fn pr_review_is_forwarded_regardless_of_sender() {
+        // Reviews on my PRs are always actionable — read the comments or merge.
         let payload = json!({
             "action": "submitted",
             "sender": {"login": "Olbrasoft"},
@@ -408,6 +421,69 @@ mod tests {
         let own = vec!["Olbrasoft".to_string()];
         let d = classify("pull_request_review", &payload, "x", &own);
         assert!(matches!(d, Decision::Forward { .. }));
+    }
+
+    #[test]
+    fn issue_opened_is_dropped_even_from_others() {
+        // Triage is not a wake-up task; @claude mentions handle "please act".
+        let payload = json!({
+            "action": "opened",
+            "issue": {"number": 5},
+            "sender": {"login": "alice"},
+        });
+        assert!(matches!(
+            classify("issues", &payload, "x", &[]),
+            Decision::Drop { .. },
+        ));
+    }
+
+    #[test]
+    fn issue_closed_reopened_labeled_are_dropped() {
+        for action in ["closed", "reopened", "labeled", "edited", "unassigned"] {
+            let payload = json!({
+                "action": action,
+                "issue": {"number": 5},
+                "sender": {"login": "alice"},
+            });
+            assert!(
+                matches!(
+                    classify("issues", &payload, "x", &[]),
+                    Decision::Drop { .. }
+                ),
+                "issues action '{action}' should be dropped",
+            );
+        }
+    }
+
+    #[test]
+    fn issue_assigned_to_me_is_forwarded() {
+        let payload = json!({
+            "action": "assigned",
+            "issue": {"number": 42},
+            "assignee": {"login": "Olbrasoft"},
+            "sender": {"login": "alice"},
+        });
+        let own = vec!["Olbrasoft".to_string()];
+        let d = classify("issues", &payload, "cr", &own);
+        assert_eq!(
+            forward(&d),
+            Some("ghnotify issue-assigned-to-me: repo=cr issue=42 assignee=Olbrasoft"),
+        );
+    }
+
+    #[test]
+    fn issue_assigned_to_someone_else_is_dropped() {
+        let payload = json!({
+            "action": "assigned",
+            "issue": {"number": 42},
+            "assignee": {"login": "bob"},
+            "sender": {"login": "alice"},
+        });
+        let own = vec!["Olbrasoft".to_string()];
+        assert!(matches!(
+            classify("issues", &payload, "cr", &own),
+            Decision::Drop { .. },
+        ));
     }
 
     #[test]

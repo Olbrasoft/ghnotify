@@ -23,7 +23,12 @@ struct Cli {
     config: Option<std::path::PathBuf>,
 
     /// Tracing filter (e.g. "ghnotify=debug,tower_http=info").
-    #[arg(long, global = true, env = "GHNOTIFY_LOG", default_value = "ghnotify=info")]
+    #[arg(
+        long,
+        global = true,
+        env = "GHNOTIFY_LOG",
+        default_value = "ghnotify=info"
+    )]
     log: String,
 }
 

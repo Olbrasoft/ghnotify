@@ -33,7 +33,7 @@ pub fn doctor() -> Result<()> {
     let tmux = Command::new("tmux").arg("-V").output();
     match tmux {
         Ok(o) if o.status.success() => {
-            check("tmux", true, &String::from_utf8_lossy(&o.stdout).trim());
+            check("tmux", true, String::from_utf8_lossy(&o.stdout).trim());
         }
         _ => check("tmux", false, "not installed (apt install tmux)"),
     }
@@ -53,7 +53,11 @@ pub fn doctor() -> Result<()> {
     let claude = Command::new("claude").arg("--version").output();
     match claude {
         Ok(o) if o.status.success() => {
-            check("claude code", true, String::from_utf8_lossy(&o.stdout).trim());
+            check(
+                "claude code",
+                true,
+                String::from_utf8_lossy(&o.stdout).trim(),
+            );
         }
         _ => check("claude code", false, "not on PATH"),
     }

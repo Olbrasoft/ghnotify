@@ -81,7 +81,10 @@ async fn handle_webhook(
         .and_then(serde_json::Value::as_str);
     let Some(repo_name) = repo_name else {
         info!(event_type, "webhook with no repository field, ignored");
-        return (StatusCode::OK, Json(serde_json::json!({ "ok": true, "ignored": true })));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "ignored": true })),
+        );
     };
 
     // 3. Classify: should we forward this event at all, and as what prompt?
@@ -93,7 +96,12 @@ async fn handle_webhook(
     ) {
         event::Decision::Forward { prompt } => prompt,
         event::Decision::Drop { reason } => {
-            info!(event_type, repo = repo_name, reason, "event dropped by filter");
+            info!(
+                event_type,
+                repo = repo_name,
+                reason,
+                "event dropped by filter"
+            );
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -110,14 +118,20 @@ async fn handle_webhook(
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
             info!(session, event_type, "prompt delivered");
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true, "session": session })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "session": session })),
+            )
         }
         // No session for this repo → soft discard. Webhook senders (gh webhook
         // forward, GitHub itself) do not retry on non-2xx anyway, but we return
         // 200 so logs stay clean: there is nothing wrong, there is just no one
         // home to wake up.
         Ok(tmux::Delivery::NoSession) => {
-            info!(session, event_type, "no claude session for repo, event discarded");
+            info!(
+                session,
+                event_type, "no claude session for repo, event discarded"
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -144,7 +158,9 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
         .ok_or("missing X-Hub-Signature-256")?
         .to_str()
         .map_err(|_| "non-ascii signature header")?;
-    let supplied = header.strip_prefix("sha256=").ok_or("malformed signature")?;
+    let supplied = header
+        .strip_prefix("sha256=")
+        .ok_or("malformed signature")?;
     let supplied_bytes = hex::decode(supplied).map_err(|_| "non-hex signature")?;
 
     let mut mac =

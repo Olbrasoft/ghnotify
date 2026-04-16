@@ -51,7 +51,9 @@ pub async fn run(
         repos
     };
 
-    let bind = bind_override.clone().unwrap_or_else(|| cfg.server.bind.clone());
+    let bind = bind_override
+        .clone()
+        .unwrap_or_else(|| cfg.server.bind.clone());
 
     // 2. Clean up zombie forwarder hooks left by a previous run (or by the
     //    legacy systemd unit). Without this, `gh webhook forward` errors with
@@ -69,10 +71,7 @@ pub async fn run(
         let url = format!("http://{bind}/webhook");
         let child = Command::new("gh")
             .args([
-                "webhook", "forward",
-                "--repo", repo,
-                "--events", &events,
-                "--url", &url,
+                "webhook", "forward", "--repo", repo, "--events", &events, "--url", &url,
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
