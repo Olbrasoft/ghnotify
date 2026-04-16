@@ -129,3 +129,5 @@ MIT
 # trailing newline test
 # watchdog E2E test trigger at 21:15:37Z
 # E2E verify after watchdog confirmed @ 21:20:53Z
+
+<!-- test marker: round-2 positive/negative classifier verification (do not delete in PR; removed on merge) -->
