@@ -18,6 +18,28 @@ pub enum Decision {
     Drop { reason: &'static str },
 }
 
+/// Trim and truncate a review/comment body for inclusion in the wake prompt.
+/// Empty → empty string; otherwise returns ` body="<excerpt>"` with newlines
+/// collapsed to spaces so the whole prompt stays on one tmux send-keys line.
+/// Cap is 200 chars — enough to convey the gist of a review summary or a
+/// line-comment without blowing up the prompt budget.
+fn excerpt_body(body: &str) -> String {
+    const MAX: usize = 200;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let flat: String = trimmed
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let cut: String = flat.chars().take(MAX).collect();
+    let truncated = flat.chars().count() > MAX;
+    let suffix = if truncated { "…" } else { "" };
+    let escaped = cut.replace('"', "'");
+    format!(" body=\"{escaped}{suffix}\"")
+}
+
 /// Classify a parsed webhook payload. `event_type` is the value of the
 /// `X-GitHub-Event` header; `repo` is the bare repo name (no owner);
 /// `own_logins` is the list of GitHub logins representing "me" (your own
@@ -32,8 +54,16 @@ pub enum Decision {
 ///   * `check_suite completed` is the one reliable CI aggregate. Success →
 ///     `ci-success` (decide whether to merge); failure/cancelled/timed_out →
 ///     `ci-failure` (fix it). Non-terminal actions are dropped.
-///   * `pull_request_review submitted` → `code-review-complete` (read
-///     comments, address or merge). `edited`/`dismissed` are noise.
+///   * `pull_request_review submitted`/`edited` → `code-review-complete`
+///     with truncated `review.body` excerpt so the session sees whether the
+///     reviewer left substantive comments (vs. just an empty "commented"
+///     review) without a round-trip. `dismissed` is dropped (withdrawn).
+///   * `pull_request_review_comment created` → `review-comment` with file
+///     path, line number, and body excerpt. Critical pairing with the
+///     review wake: Copilot often posts per-line nitpicks whose content
+///     lives only in the individual comment payloads — without this, a
+///     session seeing only `ci-success` + empty `code-review-complete`
+///     would assume "ship it" and miss the fixes to make.
 ///   * `issue_comment created` is forwarded only when the body mentions
 ///     `@claude`/`@claude-cr` or starts with `/claude` — the explicit
 ///     "please act" signal.
@@ -130,14 +160,64 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .and_then(Value::as_u64)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into());
+            let body = payload
+                .pointer("/review/body")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let excerpt = excerpt_body(body);
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state} action={action}"
+                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state} action={action}{excerpt}"
                 ),
             }
         }
         "pull_request_review" => Decision::Drop {
             reason: "review dismissed or unknown action",
+        },
+
+        // Per-line review comments. Without this handler they fall into the
+        // default drop, so a session that sees `ci-success` + an otherwise
+        // silent `pull_request_review` (state=commented, empty body) has no
+        // signal that reviewer left per-file nitpicks to address. Forward
+        // `created` only — `edited`/`deleted` on a comment the session
+        // already consumed would be churn.
+        "pull_request_review_comment" if action == "created" => {
+            let author = payload
+                .pointer("/comment/user/login")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let pr = payload
+                .pointer("/pull_request/number")
+                .and_then(Value::as_u64)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into());
+            let path = payload
+                .pointer("/comment/path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let line = payload
+                .pointer("/comment/line")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    payload
+                        .pointer("/comment/original_line")
+                        .and_then(Value::as_u64)
+                })
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into());
+            let body = payload
+                .pointer("/comment/body")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let excerpt = excerpt_body(body);
+            Decision::Forward {
+                prompt: format!(
+                    "ghnotify review-comment: repo={repo} pr={pr} author={author} file={path}:{line}{excerpt}"
+                ),
+            }
+        }
+        "pull_request_review_comment" => Decision::Drop {
+            reason: "review_comment action != created",
         },
 
         // pull_request is informational only. All wake-ups related to a PR
@@ -582,6 +662,155 @@ mod tests {
             classify("issue_comment", &payload, "x", &[]),
             Decision::Forward { .. }
         ));
+    }
+
+    #[test]
+    fn pr_review_submitted_with_body_includes_excerpt() {
+        let payload = json!({
+            "action": "submitted",
+            "review": {
+                "user": {"login": "copilot-pull-request-reviewer"},
+                "state": "commented",
+                "body": "Found 3 issues: missing null check in parser.rs, wrong error handling in importer.rs, and a race in fetcher.rs.",
+            },
+            "pull_request": {"number": 490},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=cr pr=490 reviewer=copilot-pull-request-reviewer state=commented action=submitted body=\""
+            ),
+            "prompt prefix wrong: {prompt}"
+        );
+        assert!(prompt.contains("Found 3 issues"), "body missing: {prompt}");
+    }
+
+    #[test]
+    fn pr_review_body_is_truncated_to_200_chars_with_ellipsis() {
+        let long = "x".repeat(500);
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "r"}, "state": "commented", "body": long},
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.ends_with("…\""), "no ellipsis: {prompt}");
+        // 200 x chars + ellipsis inside the quotes.
+        assert!(
+            prompt.contains(&format!(" body=\"{}…\"", "x".repeat(200))),
+            "excerpt shape wrong: {prompt}"
+        );
+    }
+
+    #[test]
+    fn pr_review_body_newlines_are_collapsed_to_spaces() {
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "r"}, "state": "commented", "body": "line1\nline2\r\nline3"},
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.contains(" body=\"line1 line2  line3\""), "{prompt}");
+        assert!(!prompt.contains('\n'));
+    }
+
+    #[test]
+    fn pr_review_empty_body_omits_body_field() {
+        // An empty or whitespace-only review body (Copilot sometimes only
+        // posts per-line comments with no summary) must NOT add an empty
+        // body="" to the prompt — noise without signal.
+        for body in ["", "   ", "\n\n"] {
+            let payload = json!({
+                "action": "submitted",
+                "review": {"user": {"login": "r"}, "state": "commented", "body": body},
+                "pull_request": {"number": 1},
+            });
+            let d = classify("pull_request_review", &payload, "cr", &[]);
+            let prompt = forward(&d).expect("forwarded");
+            assert!(!prompt.contains("body="), "body leaked: {prompt}");
+        }
+    }
+
+    #[test]
+    fn pr_review_body_double_quotes_are_escaped_to_singles() {
+        // The prompt wraps body in double-quotes so shell/tmux see one arg;
+        // inner " would break the quoting — collapse to ' instead.
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "r"}, "state": "commented", "body": "He said \"ship it\""},
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.contains(" body=\"He said 'ship it'\""), "{prompt}");
+    }
+
+    #[test]
+    fn pr_review_comment_created_is_forwarded_with_path_line_body() {
+        let payload = json!({
+            "action": "created",
+            "comment": {
+                "body": "This should use `?` instead of `unwrap`.",
+                "path": "src/parser.rs",
+                "line": 42,
+                "user": {"login": "copilot-pull-request-reviewer"},
+            },
+            "pull_request": {"number": 490},
+        });
+        let d = classify("pull_request_review_comment", &payload, "cr", &[]);
+        assert_eq!(
+            forward(&d),
+            Some(
+                "ghnotify review-comment: repo=cr pr=490 author=copilot-pull-request-reviewer file=src/parser.rs:42 body=\"This should use `?` instead of `unwrap`.\""
+            ),
+        );
+    }
+
+    #[test]
+    fn pr_review_comment_edited_and_deleted_are_dropped() {
+        // Only `created` wakes the session. Edits/deletes on comments
+        // already consumed would be churn.
+        for action in ["edited", "deleted"] {
+            let payload = json!({
+                "action": action,
+                "comment": {"body": "x", "path": "a", "line": 1, "user": {"login": "u"}},
+                "pull_request": {"number": 1},
+            });
+            assert!(
+                matches!(
+                    classify("pull_request_review_comment", &payload, "x", &[]),
+                    Decision::Drop { .. }
+                ),
+                "action {action} should be dropped",
+            );
+        }
+    }
+
+    #[test]
+    fn pr_review_comment_falls_back_to_original_line_if_line_missing() {
+        // On outdated comments GitHub sets `line: null` but keeps
+        // `original_line`. Prefer either over a "?" in the prompt.
+        let payload = json!({
+            "action": "created",
+            "comment": {
+                "body": "nit: trailing whitespace",
+                "path": "x.rs",
+                "line": null,
+                "original_line": 7,
+                "user": {"login": "u"},
+            },
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review_comment", &payload, "cr", &[]);
+        assert_eq!(
+            forward(&d),
+            Some(
+                "ghnotify review-comment: repo=cr pr=1 author=u file=x.rs:7 body=\"nit: trailing whitespace\""
+            ),
+        );
     }
 
     #[test]
