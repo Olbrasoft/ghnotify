@@ -58,14 +58,21 @@ pub fn classify(
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    // Self-author skip: don't wake for events this user (or one of their
-    // bots) caused. Note that `ping` events have no sender; the unwrap_or("")
-    // means they fall through to the normal classifier.
-    if let Some(sender) = payload.pointer("/sender/login").and_then(Value::as_str) {
-        if own_logins.iter().any(|own| own == sender) {
-            return Decision::Drop {
-                reason: "self-authored event (sender in own_logins)",
-            };
+    // Self-author skip applies ONLY to event types where "sender" semantically
+    // means "the human (or my bot) who deliberately performed this action and
+    // therefore already knows about it" — opening/closing a PR or issue.
+    //
+    // Critically NOT applied to check_suite / pull_request_review /
+    // issue_comment: on check_suite the `sender` field is the pusher of the
+    // commit that triggered CI, so suppressing those would silence the most
+    // important wake event of all — the result of CI on my own push.
+    if matches!(event_type, "pull_request" | "issues") {
+        if let Some(sender) = payload.pointer("/sender/login").and_then(Value::as_str) {
+            if own_logins.iter().any(|own| own == sender) {
+                return Decision::Drop {
+                    reason: "self-authored pull_request/issue (sender in own_logins)",
+                };
+            }
         }
     }
 
@@ -345,27 +352,60 @@ mod tests {
     }
 
     #[test]
-    fn self_authored_event_is_dropped() {
+    fn self_authored_pr_open_is_dropped() {
         let payload = json!({
-            "action": "submitted",
-            "sender": {"login": "github-actions[bot]"},
-            "review": {"user": {"login": "human-reviewer"}, "state": "approved"},
-            "pull_request": {"number": 1},
+            "action": "opened",
+            "sender": {"login": "Olbrasoft"},
+            "pull_request": {"number": 99, "merged": false},
         });
-        let own = vec!["jirka".to_string(), "github-actions[bot]".to_string()];
-        let d = classify("pull_request_review", &payload, "x", &own);
+        let own = vec!["Olbrasoft".to_string()];
+        let d = classify("pull_request", &payload, "x", &own);
         assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
-    fn other_authored_event_passes_self_skip() {
+    fn other_authored_pr_open_passes_self_skip() {
+        let payload = json!({
+            "action": "opened",
+            "sender": {"login": "copilot[bot]"},
+            "pull_request": {"number": 99, "merged": false},
+        });
+        let own = vec!["Olbrasoft".to_string()];
+        let d = classify("pull_request", &payload, "x", &own);
+        assert!(matches!(d, Decision::Forward { .. }));
+    }
+
+    #[test]
+    fn self_authored_check_suite_is_NOT_dropped() {
+        // Critical: ci-complete events MUST reach the session even though the
+        // pusher (= sender) is in own_logins. Otherwise the assistant never
+        // hears about CI results for its own pushes.
+        let payload = json!({
+            "action": "completed",
+            "sender": {"login": "Olbrasoft"},
+            "check_suite": {
+                "conclusion": "success",
+                "head_sha": "abc12345",
+                "head_branch": "fix/foo",
+                "pull_requests": [{"number": 99}],
+            },
+        });
+        let own = vec!["Olbrasoft".to_string()];
+        let d = classify("check_suite", &payload, "cr", &own);
+        assert!(matches!(d, Decision::Forward { .. }));
+    }
+
+    #[test]
+    fn self_authored_pr_review_is_NOT_dropped() {
+        // Same reason: even if the review event arrives with sender=self for
+        // some payload reason, we want to know about reviews on my PRs.
         let payload = json!({
             "action": "submitted",
-            "sender": {"login": "copilot[bot]"},
+            "sender": {"login": "Olbrasoft"},
             "review": {"user": {"login": "copilot[bot]"}, "state": "commented"},
             "pull_request": {"number": 1},
         });
-        let own = vec!["jirka".to_string()];
+        let own = vec!["Olbrasoft".to_string()];
         let d = classify("pull_request_review", &payload, "x", &own);
         assert!(matches!(d, Decision::Forward { .. }));
     }
