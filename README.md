@@ -24,38 +24,17 @@ external events route in via `tmux send-keys`.
 
 ```bash
 cargo install --git https://github.com/Olbrasoft/ghnotify
+ghnotify install        # writes the claude() shell wrapper to ~/.bashrc
 ```
 
-You also need a `claude()` shell wrapper that puts every Claude session into a
-tmux pane named `claude-<repo>`. Add this to `~/.bashrc` (or `~/.zshrc`):
+`ghnotify install` is idempotent — re-running updates the managed block in
+place. Use `--shell zsh` to target `~/.zshrc`, `--rc <path>` for a custom file,
+or `--dry-run` to preview the change without writing.
 
-```bash
-claude() {
-    if [ -n "$TMUX" ]; then
-        command claude "$@"
-        return
-    fi
-    for arg in "$@"; do
-        case "$arg" in
-            -p|--print|--version|--help|-h|-v) command claude "$@"; return ;;
-        esac
-    done
-    local name root
-    if root=$(git rev-parse --show-toplevel 2>/dev/null); then
-        name="claude-$(basename "$root")"
-    else
-        name="claude-home"
-    fi
-    name="${name//./-}"
-    if tmux has-session -t "$name" 2>/dev/null; then
-        exec tmux attach -t "$name"
-    fi
-    exec tmux new-session -s "$name" -- claude "$@"
-}
-```
-
-After that, `claude --continue` inside any repo automatically wraps in a tmux
-session whose name ghnotify can address.
+The wrapper makes every `claude` invocation land inside a tmux session named
+`claude-<repo>`, which is the address `ghnotify serve` uses to route incoming
+webhook events. Open a new terminal (or `source ~/.bashrc`) for it to take
+effect.
 
 ## Use
 
@@ -108,11 +87,25 @@ webhook_secret = "abc..."
 
 MVP — basic plumbing works. Roadmap:
 
-- [ ] `ghnotify install` subcommand: writes the `claude()` wrapper and
-      registers the launcher.
+- [x] `ghnotify install` subcommand: writes the `claude()` wrapper into
+      `~/.bashrc` / `~/.zshrc` between managed markers.
+- [ ] Embed `gh webhook forward` so a single `ghnotify watch` process handles
+      both the GitHub relay and the tmux dispatch (no separate daemon needed).
 - [ ] Per-event-type prompt templates (CI failure → "fix it", review done →
       "address comments").
 - [ ] Pre-built binaries on Releases for Linux/macOS/Windows.
+
+## Retry semantics
+
+ghnotify intentionally does **not** queue or retry. When a webhook arrives:
+
+- Target tmux session exists → prompt is delivered, response is `200 {ok:true}`.
+- Target session is missing → event is discarded, response is `200 {discarded:true}`.
+
+This matches what's upstream of us anyway: `gh webhook forward` does not retry
+on local non-2xx, and GitHub itself does not auto-retry repository webhooks
+(failed deliveries sit in the 30-day delivery history for manual replay via
+the REST API). There's nothing to gain from buffering events on our side.
 
 ## License
 

@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod config;
+mod install;
 mod sessions;
 mod tmux;
 mod webhook;
@@ -49,6 +50,22 @@ enum Command {
 
     /// Diagnostics: tmux installed, gh-cli auth, config reachable, sessions present.
     Doctor,
+
+    /// Install the `claude()` shell wrapper into ~/.bashrc or ~/.zshrc.
+    /// Idempotent: re-running updates the managed block in place.
+    Install {
+        /// Which shell rc to target. Default: detect from $SHELL.
+        #[arg(long, value_parser = ["bash", "zsh"])]
+        shell: Option<String>,
+
+        /// Explicit rc file path. Overrides --shell and $SHELL detection.
+        #[arg(long)]
+        rc: Option<std::path::PathBuf>,
+
+        /// Print the planned change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -67,9 +84,16 @@ async fn main() -> Result<()> {
         }
         Command::Send { repo, prompt } => {
             let session = tmux::session_name_for_repo(&repo);
-            tmux::send_prompt(&session, &prompt)?;
-            println!("delivered prompt to tmux session: {session}");
-            Ok(())
+            match tmux::send_prompt(&session, &prompt)? {
+                tmux::Delivery::Delivered => {
+                    println!("delivered prompt to tmux session: {session}");
+                    Ok(())
+                }
+                tmux::Delivery::NoSession => {
+                    eprintln!("no tmux session named '{session}'. Use `ghnotify list` to see available sessions.");
+                    std::process::exit(2);
+                }
+            }
         }
         Command::List => {
             for s in sessions::list_claude_sessions()? {
@@ -78,5 +102,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => sessions::doctor(),
+        Command::Install { shell, rc, dry_run } => {
+            let shell = match shell.as_deref() {
+                Some(s) => install::Shell::from_name(s)?,
+                None => install::Shell::detect(),
+            };
+            let rc_path = install::resolve_rc_path(rc, shell)?;
+            install::run(rc_path, dry_run).map(|_| ())
+        }
     }
 }

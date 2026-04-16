@@ -23,7 +23,17 @@ pub fn has_session(name: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Send a prompt into a running tmux session.
+/// Outcome of an attempted prompt delivery.
+pub enum Delivery {
+    /// Prompt was typed and Enter was sent.
+    Delivered,
+    /// No tmux session by that name. The caller should treat this as a soft
+    /// discard, not a server-side error: there is no Claude session to wake,
+    /// and webhooks must not be retried in this case.
+    NoSession,
+}
+
+/// Send a prompt into a running tmux session, if one exists.
 ///
 /// Sends in two steps to work around Claude Code TUI input handling:
 ///   1. type the literal prompt text (no auto-submit)
@@ -31,12 +41,9 @@ pub fn has_session(name: &str) -> Result<bool> {
 ///
 /// Without the split, the TUI sometimes accepts the text but discards the Enter
 /// (verified empirically on claude-code 2.1.111).
-pub fn send_prompt(session: &str, prompt: &str) -> Result<()> {
+pub fn send_prompt(session: &str, prompt: &str) -> Result<Delivery> {
     if !has_session(session)? {
-        return Err(anyhow!(
-            "tmux session '{session}' not found. Is the Claude session running? \
-             Use `ghnotify list` to see available sessions."
-        ));
+        return Ok(Delivery::NoSession);
     }
 
     // Step 1: type the prompt text (no Enter)
@@ -59,5 +66,5 @@ pub fn send_prompt(session: &str, prompt: &str) -> Result<()> {
         return Err(anyhow!("tmux send-keys returned non-zero for Enter"));
     }
 
-    Ok(())
+    Ok(Delivery::Delivered)
 }

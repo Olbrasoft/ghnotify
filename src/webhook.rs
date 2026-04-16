@@ -104,9 +104,25 @@ async fn handle_webhook(
     );
 
     match tmux::send_prompt(&session, &prompt) {
-        Ok(()) => {
+        Ok(tmux::Delivery::Delivered) => {
             info!(session, event_type, "prompt delivered");
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "session": session })))
+        }
+        // No session for this repo → soft discard. Webhook senders (gh webhook
+        // forward, GitHub itself) do not retry on non-2xx anyway, but we return
+        // 200 so logs stay clean: there is nothing wrong, there is just no one
+        // home to wake up.
+        Ok(tmux::Delivery::NoSession) => {
+            info!(session, event_type, "no claude session for repo, event discarded");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "discarded": true,
+                    "reason": "no claude session running for this repo",
+                    "session": session,
+                })),
+            )
         }
         Err(e) => {
             error!(session, error = %e, "tmux send_prompt failed");
