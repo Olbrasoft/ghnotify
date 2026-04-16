@@ -126,3 +126,4 @@ the REST API). There's nothing to gain from buffering events on our side.
 ## License
 
 MIT
+# trailing newline test
