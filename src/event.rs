@@ -43,6 +43,7 @@ fn excerpt_body(body: &str) -> String {
 
     let mut excerpt = String::with_capacity(MAX * 4);
     let mut truncated = false;
+    let mut has_visible = false;
 
     for (i, c) in trimmed.chars().enumerate() {
         if i == MAX {
@@ -56,7 +57,19 @@ fn excerpt_body(body: &str) -> String {
         } else {
             c
         };
+        if !sanitized.is_whitespace() {
+            has_visible = true;
+        }
         excerpt.push(sanitized);
+    }
+
+    // `str::trim` only removes ASCII/Unicode whitespace, not control chars, so
+    // a body of pure control bytes (e.g. ESC + BEL) would pass the early
+    // `trimmed.is_empty()` guard and then be sanitized into a run of spaces —
+    // emitting ` body="   "` as pure noise. If nothing visible survived the
+    // sanitizer, treat the excerpt as empty.
+    if !has_visible {
+        return String::new();
     }
 
     if truncated {
@@ -81,7 +94,11 @@ fn excerpt_body(body: &str) -> String {
 /// Forwarding rules:
 ///   * `check_suite completed` is the one reliable CI aggregate. Success →
 ///     `ci-success` (decide whether to merge); failure/cancelled/timed_out →
-///     `ci-failure` (fix it). Non-terminal actions are dropped.
+///     `ci-failure` (fix it). Non-terminal actions are dropped. The
+///     parallel check_suite that GitHub dispatches on the synthetic
+///     `refs/pull/N/…` ref for every PR is dropped — the branch-named
+///     pair is strictly more informative and forwarding both means the
+///     session is woken twice per CI run.
 ///   * `pull_request_review submitted`/`edited` → `code-review-complete`
 ///     with truncated `review.body` excerpt so the session sees whether the
 ///     reviewer left substantive comments (vs. just an empty "commented"
@@ -116,6 +133,27 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
         },
 
         "check_suite" if action == "completed" => {
+            let head_branch = payload
+                .pointer("/check_suite/head_branch")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            // GitHub dispatches a parallel check_suite on the synthetic
+            // `refs/pull/N/head` (and sometimes `refs/pull/N/merge`) ref for
+            // every PR, in addition to the one for the PR's actual branch
+            // name (e.g. `fix/foo`). Both fire for the same head_sha, so
+            // forwarding both means the session gets two ci-success/failure
+            // wakes for every PR CI run. The named-branch one is strictly
+            // more informative (carries the real branch name + pr numbers
+            // together), so drop the synthetic ref to keep 1 wake per run.
+            // Post-merge redelivery of the synthetic ref is the specific
+            // case that used to look like "a late duplicate wake arriving
+            // after merge" — it's not late, it's just the second of the
+            // pair completing.
+            if head_branch.starts_with("refs/pull/") {
+                return Decision::Drop {
+                    reason: "check_suite on refs/pull/ synthetic ref (pair-dup of branch-named check_suite)",
+                };
+            }
             let conclusion = payload
                 .pointer("/check_suite/conclusion")
                 .and_then(Value::as_str)
@@ -124,10 +162,6 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .pointer("/check_suite/head_sha")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let head_branch = payload
-                .pointer("/check_suite/head_branch")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
             let prs: Vec<String> = payload
                 .pointer("/check_suite/pull_requests")
                 .and_then(Value::as_array)
@@ -739,6 +773,72 @@ mod tests {
             excerpt.chars().count(),
             200,
             "excerpt must be exactly 200 chars including ellipsis: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn pr_review_body_all_control_chars_yields_no_body_field() {
+        // str::trim only strips whitespace, not control chars like ESC/BEL,
+        // so a body of pure control bytes would sail past the early empty
+        // guard, be sanitized into a run of spaces, and emit ` body="   "`
+        // — visually empty but still there, pure noise. Nothing-visible
+        // must collapse back to no body field at all.
+        for body in ["\u{001b}\u{0007}", "\u{0000}\u{007f}\u{000b}"] {
+            let payload = json!({
+                "action": "submitted",
+                "review": {"user": {"login": "r"}, "state": "commented", "body": body},
+                "pull_request": {"number": 1},
+            });
+            let d = classify("pull_request_review", &payload, "cr", &[]);
+            let prompt = forward(&d).expect("forwarded");
+            assert!(!prompt.contains("body="), "empty body leaked: {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn check_suite_on_refs_pull_synthetic_ref_is_dropped() {
+        // GitHub dispatches a parallel check_suite for every PR on the
+        // synthetic `refs/pull/N/head` ref, in addition to the one on the
+        // PR's branch name. Forwarding both wakes the session twice for
+        // the same CI run. Drop the synthetic-ref one.
+        for head_branch in ["refs/pull/4/head", "refs/pull/123/merge"] {
+            let payload = json!({
+                "action": "completed",
+                "check_suite": {
+                    "conclusion": "success",
+                    "head_sha": "ca6a94d2",
+                    "head_branch": head_branch,
+                    "pull_requests": [],
+                },
+            });
+            assert!(
+                matches!(
+                    classify("check_suite", &payload, "ghnotify", &[]),
+                    Decision::Drop { .. }
+                ),
+                "refs/pull/ head_branch {head_branch} should be dropped",
+            );
+        }
+    }
+
+    #[test]
+    fn check_suite_on_named_branch_is_still_forwarded() {
+        // Guard against over-filtering: a genuine feature-branch
+        // check_suite must continue to wake the session. Only the
+        // refs/pull/… synthetic-ref variant is suppressed.
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_sha": "ca6a94d2",
+                "head_branch": "fix/sanitize-excerpt-control-chars",
+                "pull_requests": [{"number": 4}],
+            },
+        });
+        let d = classify("check_suite", &payload, "ghnotify", &[]);
+        assert!(
+            matches!(d, Decision::Forward { .. }),
+            "named-branch check_suite must be forwarded",
         );
     }
 
