@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod discover;
+mod event;
 mod install;
 mod sessions;
 mod tmux;

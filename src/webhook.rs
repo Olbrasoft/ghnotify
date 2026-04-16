@@ -4,7 +4,7 @@
 //! GitHub event payload shape (subset we care about):
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
 
-use crate::{config::Config, tmux};
+use crate::{config::Config, event, tmux};
 use anyhow::Result;
 use axum::{
     body::Bytes,
@@ -14,7 +14,6 @@ use axum::{
     Json, Router,
 };
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -23,20 +22,6 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
-}
-
-#[derive(Deserialize)]
-struct WebhookPayload {
-    /// GitHub `repository` object — present on most event types.
-    #[serde(default)]
-    repository: Option<Repository>,
-}
-
-#[derive(Deserialize)]
-struct Repository {
-    name: String,
-    #[allow(dead_code)]
-    full_name: String,
 }
 
 pub async fn serve(cfg: Config, bind_override: Option<String>) -> Result<()> {
@@ -74,8 +59,8 @@ async fn handle_webhook(
         }
     }
 
-    // 2. Parse payload.
-    let payload: WebhookPayload = match serde_json::from_slice(&body) {
+    // 2. Parse payload as a generic JSON value (the classifier reads many fields).
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "webhook body is not valid JSON");
@@ -91,18 +76,32 @@ async fn handle_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let Some(repo) = payload.repository else {
+    let repo_name = payload
+        .pointer("/repository/name")
+        .and_then(serde_json::Value::as_str);
+    let Some(repo_name) = repo_name else {
         info!(event_type, "webhook with no repository field, ignored");
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true, "ignored": true })));
     };
 
-    // 3. Build the prompt and dispatch.
-    let session = tmux::session_name_for_repo(&repo.name);
-    let prompt = format!(
-        "Channel event from ghnotify: type={} repo={}",
-        event_type, repo.name
-    );
+    // 3. Classify: should we forward this event at all, and as what prompt?
+    let prompt = match event::classify(event_type, &payload, repo_name) {
+        event::Decision::Forward { prompt } => prompt,
+        event::Decision::Drop { reason } => {
+            info!(event_type, repo = repo_name, reason, "event dropped by filter");
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "filtered": true,
+                    "reason": reason,
+                })),
+            );
+        }
+    };
 
+    // 4. Dispatch to the matching tmux session.
+    let session = tmux::session_name_for_repo(repo_name);
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
             info!(session, event_type, "prompt delivered");

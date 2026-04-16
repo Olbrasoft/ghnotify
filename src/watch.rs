@@ -18,10 +18,17 @@ use tracing::{info, warn};
 /// Stable string, used to identify zombie hooks left behind by previous runs.
 const FORWARDER_HOOK_URL: &str = "https://webhook-forwarder.github.com/hook";
 
-/// Default GitHub events to subscribe to. Picked to match what the legacy
-/// `start-webhook-forwards.sh` shipped: enough for CI + code-review wakes
-/// without spamming push/issue noise.
-pub const DEFAULT_EVENTS: &str = "pull_request_review,check_suite,workflow_run";
+/// Default GitHub events to subscribe to. Each subscribed event is then
+/// passed through `event::classify` to filter out noise (per-file
+/// `workflow_run`, queued/in_progress `check_suite` transitions, etc.) and
+/// reformatted into a meaningful prompt before delivery.
+///
+/// `workflow_run` is intentionally absent — `check_suite` is the aggregate
+/// of every workflow that ran for a commit, so subscribing to both would
+/// double up. `ping` is sent by GitHub on hook creation regardless of
+/// subscription, no need to list it.
+pub const DEFAULT_EVENTS: &str =
+    "check_suite,pull_request_review,pull_request,issues,issue_comment";
 
 pub async fn run(
     cfg: Config,
