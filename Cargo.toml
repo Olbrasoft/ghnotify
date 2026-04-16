@@ -1,0 +1,38 @@
+[package]
+name = "ghnotify"
+version = "0.1.0"
+edition = "2021"
+authors = ["Olbrasoft"]
+license = "MIT"
+description = "Cross-platform single-binary GitHub webhook → Claude Code session forwarder via tmux send-keys."
+repository = "https://github.com/Olbrasoft/ghnotify"
+readme = "README.md"
+keywords = ["github", "webhook", "claude", "tmux", "notification"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ghnotify"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+dirs = "5"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
