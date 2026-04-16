@@ -34,27 +34,27 @@ pub struct Github {
     /// If unset, signatures are NOT verified — only acceptable for `gh webhook forward`-style local relay.
     pub webhook_secret: Option<String>,
 
-    /// Logins whose actions should NOT wake your Claude session — typically
-    /// your own GitHub username plus any bots that act on your behalf
-    /// (`github-actions[bot]`, `claude[bot]`, etc.). When the webhook payload
-    /// has `sender.login` matching any entry, the event is dropped.
+    /// Logins representing "me" — your own GitHub username and any bots that
+    /// act on your behalf. Used by the classifier for positive matching on
+    /// `issues.assigned` (only wake when the assignee is me), not as a
+    /// sender-drop list. Sender-based self-skip was removed: `pull_request`
+    /// events are never wakes anymore regardless of sender, and `check_suite`
+    /// / `pull_request_review` must always forward.
     ///
-    /// Example: `own_logins = ["jirka", "github-actions[bot]", "claude[bot]"]`
+    /// Example: `own_logins = ["Olbrasoft"]`
     #[serde(default)]
     pub own_logins: Vec<String>,
 }
 
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
-    let path = explicit
-        .map(PathBuf::from)
-        .or_else(|| {
-            let cwd = PathBuf::from("./ghnotify.toml");
-            if cwd.exists() {
-                Some(cwd)
-            } else {
-                dirs::config_dir().map(|d| d.join("ghnotify/config.toml"))
-            }
-        });
+    let path = explicit.map(PathBuf::from).or_else(|| {
+        let cwd = PathBuf::from("./ghnotify.toml");
+        if cwd.exists() {
+            Some(cwd)
+        } else {
+            dirs::config_dir().map(|d| d.join("ghnotify/config.toml"))
+        }
+    });
 
     let Some(path) = path else {
         return Ok(Config::default());

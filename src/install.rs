@@ -99,10 +99,10 @@ pub fn resolve_rc_path(explicit: Option<PathBuf>, shell: Shell) -> Result<PathBu
 /// What an `install` invocation actually did. Useful for tests and dry-run output.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Created,    // file did not exist; created with snippet
-    Inserted,   // file existed without our block; appended
-    Replaced,   // file had our block; we replaced it (content differed)
-    Unchanged,  // file had our block already and content matched
+    Created,   // file did not exist; created with snippet
+    Inserted,  // file existed without our block; appended
+    Replaced,  // file had our block; we replaced it (content differed)
+    Unchanged, // file had our block already and content matched
 }
 
 pub fn run(rc_path: PathBuf, dry_run: bool) -> Result<Action> {
@@ -139,8 +139,10 @@ pub fn run(rc_path: PathBuf, dry_run: bool) -> Result<Action> {
     };
     println!("✓ {verb} {}", rc_path.display());
     println!();
-    println!("Open a new terminal (or `source {}`) for the wrapper to take effect.",
-        rc_path.display());
+    println!(
+        "Open a new terminal (or `source {}`) for the wrapper to take effect.",
+        rc_path.display()
+    );
     Ok(action)
 }
 
@@ -231,9 +233,7 @@ mod tests {
 
     #[test]
     fn replaces_existing_block() {
-        let stale = format!(
-            "user line\n{BEGIN_MARK}\nold body\n{END_MARK}\ntrailing line\n",
-        );
+        let stale = format!("user line\n{BEGIN_MARK}\nold body\n{END_MARK}\ntrailing line\n",);
         let (out, action) = compute_new_content(&stale);
         assert_eq!(action, Action::Replaced);
         assert!(out.contains("user line\n"));
