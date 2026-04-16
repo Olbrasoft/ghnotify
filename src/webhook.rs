@@ -167,9 +167,14 @@ async fn process_webhook(
     ) {
         event::Decision::Forward { prompt } => prompt,
         event::Decision::Drop { reason } => {
+            let action = payload
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             info!(
                 event_type,
                 repo = repo_name,
+                action,
                 reason,
                 "event dropped by filter"
             );

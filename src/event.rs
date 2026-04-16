@@ -111,7 +111,12 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
             reason: "check_run subordinate to check_suite",
         },
 
-        "pull_request_review" if action == "submitted" => {
+        // Forward both `submitted` (new review) and `edited` (review body
+        // changed after posting). Observed in the wild: Copilot's code-review
+        // bot sometimes emits `edited` without a preceding `submitted` — the
+        // actionable content *is* in the edit, so dropping it hangs the
+        // session. Only `dismissed` is dropped (review was withdrawn).
+        "pull_request_review" if action == "submitted" || action == "edited" => {
             let reviewer = payload
                 .pointer("/review/user/login")
                 .and_then(Value::as_str)
@@ -127,12 +132,12 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .unwrap_or_else(|| "?".into());
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state}"
+                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state} action={action}"
                 ),
             }
         }
         "pull_request_review" => Decision::Drop {
-            reason: "review action != submitted",
+            reason: "review dismissed or unknown action",
         },
 
         // pull_request is informational only. All wake-ups related to a PR
@@ -316,19 +321,24 @@ mod tests {
         let d = classify("pull_request_review", &payload, "GitHub.Issues", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify code-review-complete: repo=GitHub.Issues pr=123 reviewer=copilot[bot] state=commented"),
+            Some("ghnotify code-review-complete: repo=GitHub.Issues pr=123 reviewer=copilot[bot] state=commented action=submitted"),
         );
     }
 
     #[test]
-    fn pr_review_edited_is_dropped() {
-        let d = classify(
-            "pull_request_review",
-            &json!({"action": "edited"}),
-            "x",
-            &[],
+    fn pr_review_edited_is_forwarded() {
+        // Copilot's reviewer bot is observed emitting `edited` when it finalizes
+        // its review body. The content is still a real review, so forward.
+        let payload = json!({
+            "action": "edited",
+            "review": {"user": {"login": "copilot-pull-request-reviewer"}, "state": "commented"},
+            "pull_request": {"number": 361},
+        });
+        let d = classify("pull_request_review", &payload, "GitHub.Issues", &[]);
+        assert_eq!(
+            forward(&d),
+            Some("ghnotify code-review-complete: repo=GitHub.Issues pr=361 reviewer=copilot-pull-request-reviewer state=commented action=edited"),
         );
-        assert!(matches!(d, Decision::Drop { .. }));
     }
 
     #[test]
@@ -336,6 +346,17 @@ mod tests {
         let d = classify(
             "pull_request_review",
             &json!({"action": "dismissed"}),
+            "x",
+            &[],
+        );
+        assert!(matches!(d, Decision::Drop { .. }));
+    }
+
+    #[test]
+    fn pr_review_unknown_action_is_dropped() {
+        let d = classify(
+            "pull_request_review",
+            &json!({"action": "some_future_action"}),
             "x",
             &[],
         );
@@ -352,7 +373,7 @@ mod tests {
         let d = classify("pull_request_review", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=42 reviewer=human-reviewer state=approved"),
+            Some("ghnotify code-review-complete: repo=cr pr=42 reviewer=human-reviewer state=approved action=submitted"),
         );
     }
 
@@ -366,7 +387,7 @@ mod tests {
         let d = classify("pull_request_review", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=7 reviewer=strict-reviewer state=changes_requested"),
+            Some("ghnotify code-review-complete: repo=cr pr=7 reviewer=strict-reviewer state=changes_requested action=submitted"),
         );
     }
 
@@ -378,7 +399,7 @@ mod tests {
         let d = classify("pull_request_review", &payload, "cr", &[]);
         assert_eq!(
             forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=? reviewer=? state=?"),
+            Some("ghnotify code-review-complete: repo=cr pr=? reviewer=? state=? action=submitted"),
         );
     }
 
