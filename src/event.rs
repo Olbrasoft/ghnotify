@@ -18,26 +18,54 @@ pub enum Decision {
     Drop { reason: &'static str },
 }
 
-/// Trim and truncate a review/comment body for inclusion in the wake prompt.
-/// Empty → empty string; otherwise returns ` body="<excerpt>"` with newlines
-/// collapsed to spaces so the whole prompt stays on one tmux send-keys line.
-/// Cap is 200 chars — enough to convey the gist of a review summary or a
-/// line-comment without blowing up the prompt budget.
+/// Trim, sanitize, and truncate a review/comment body for inclusion in the
+/// wake prompt. Empty → empty string; otherwise returns ` body="<excerpt>"`.
+///
+/// **Security:** the prompt is forwarded to `tmux send-keys -l` which is
+/// literal — but a session running `claude` renders received text on a
+/// terminal, and ESC (`\u{001b}`) + CSI bytes embedded in a GitHub review
+/// body would be interpreted as terminal control sequences / keystroke
+/// injection by the TUI. The sanitizer maps every `char::is_control()`
+/// character to a space so untrusted GitHub content can never smuggle
+/// escape codes through. `"` is remapped to `'` because the excerpt is
+/// wrapped in double-quotes in the final prompt.
+///
+/// Cap is 200 chars **total** (including the trailing `…` when truncated);
+/// the ellipsis is budgeted in, not appended outside the limit. The body
+/// is walked once, accumulating directly into the output buffer, so large
+/// review bodies don't cause redundant allocation / counting passes.
 fn excerpt_body(body: &str) -> String {
     const MAX: usize = 200;
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    let flat: String = trimmed
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let cut: String = flat.chars().take(MAX).collect();
-    let truncated = flat.chars().count() > MAX;
-    let suffix = if truncated { "…" } else { "" };
-    let escaped = cut.replace('"', "'");
-    format!(" body=\"{escaped}{suffix}\"")
+
+    let mut excerpt = String::with_capacity(MAX * 4);
+    let mut truncated = false;
+
+    for (i, c) in trimmed.chars().enumerate() {
+        if i == MAX {
+            truncated = true;
+            break;
+        }
+        let sanitized = if c.is_control() {
+            ' '
+        } else if c == '"' {
+            '\''
+        } else {
+            c
+        };
+        excerpt.push(sanitized);
+    }
+
+    if truncated {
+        // Make room for the ellipsis within MAX by popping the last char.
+        excerpt.pop();
+        excerpt.push('…');
+    }
+
+    format!(" body=\"{excerpt}\"")
 }
 
 /// Classify a parsed webhook payload. `event_type` is the value of the
@@ -697,11 +725,50 @@ mod tests {
         let d = classify("pull_request_review", &payload, "cr", &[]);
         let prompt = forward(&d).expect("forwarded");
         assert!(prompt.ends_with("…\""), "no ellipsis: {prompt}");
-        // 200 x chars + ellipsis inside the quotes.
+        // Ellipsis is budgeted inside the 200-char cap: 199 x chars + `…` =
+        // 200 chars total inside the quotes, not 201.
         assert!(
-            prompt.contains(&format!(" body=\"{}…\"", "x".repeat(200))),
+            prompt.contains(&format!(" body=\"{}…\"", "x".repeat(199))),
             "excerpt shape wrong: {prompt}"
         );
+        // Locked in: extract the body excerpt and count its chars.
+        let start = prompt.find(" body=\"").unwrap() + " body=\"".len();
+        let end = prompt.len() - 1; // trailing "
+        let excerpt = &prompt[start..end];
+        assert_eq!(
+            excerpt.chars().count(),
+            200,
+            "excerpt must be exactly 200 chars including ellipsis: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn pr_review_body_control_chars_are_replaced_with_spaces() {
+        // Security: any C0/C1 control character in a review body must not
+        // survive into the prompt. A raw ESC byte followed by CSI bytes would
+        // be interpreted as a terminal escape sequence by the receiving
+        // Claude TUI (ANSI cursor-up, paste-bracket injection, etc.).
+        // Untrusted GitHub content must be declawed to spaces.
+        let payload = json!({
+            "action": "submitted",
+            "review": {
+                "user": {"login": "attacker"},
+                "state": "commented",
+                // ESC [ 2 J   (clear screen), BEL, NUL, DEL
+                "body": "hi\u{001b}[2Jbye\u{0007}\u{0000}end\u{007f}tail",
+            },
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        // No raw ESC / BEL / NUL / DEL in the output.
+        assert!(!prompt.contains('\u{001b}'), "ESC leaked: {prompt:?}");
+        assert!(!prompt.contains('\u{0007}'), "BEL leaked: {prompt:?}");
+        assert!(!prompt.contains('\u{0000}'), "NUL leaked: {prompt:?}");
+        assert!(!prompt.contains('\u{007f}'), "DEL leaked: {prompt:?}");
+        // Each control char becomes a space — the surrounding visible text
+        // is preserved so the reader still sees "hi  [2Jbye  end tail".
+        assert!(prompt.contains(" body=\"hi [2Jbye  end tail\""), "{prompt}");
     }
 
     #[test]
