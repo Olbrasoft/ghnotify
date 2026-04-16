@@ -177,10 +177,13 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
             //
             // The predicate matches the exact shape
             // `refs/pull/<digits>/(head|merge)` rather than a naive
-            // prefix check, so a hypothetical real branch whose name
-            // happens to start with `refs/pull/` (harmless but possible
-            // in user-authored refs namespaces) is not accidentally
-            // suppressed.
+            // prefix check, which rules out the common lookalikes
+            // (`refs/pulls/…`, `refs/pull/4/patch`, non-numeric middle,
+            // extra trailing path). A user deliberately naming a
+            // branch exactly `refs/pull/<digits>/(head|merge)` would
+            // still be suppressed — see the docstring on
+            // `is_refs_pull_synthetic` for why that residual collision
+            // is accepted.
             if is_refs_pull_synthetic(head_branch) {
                 return Decision::Drop {
                     reason: "check_suite on refs/pull/ synthetic ref (pair-dup of branch-named check_suite)",
