@@ -106,6 +106,28 @@ fn excerpt_body(body: &str) -> String {
     format!(" body=\"{excerpt}\"")
 }
 
+/// Concrete next-step instruction appended to the `code-review-complete`
+/// wake. Without it sessions loop on wishful thinking ("surely Copilot will
+/// re-review my fix-push") and hang indefinitely; Copilot only reviews once
+/// per explicit request and does NOT auto re-review on subsequent pushes.
+/// The hint is tailored to the review state so the verb is unambiguous.
+fn next_action_hint(state: &str) -> &'static str {
+    match state {
+        "approved" => {
+            " | next: if CI green → merge now. No further review expected; do not wait."
+        }
+        "changes_requested" => {
+            " | next: read ALL comments (gh pr view <pr> / gh api repos/OWNER/REPO/pulls/<pr>/comments), fix every item, push, then merge when CI green. Copilot reviews once per request — it will NOT auto re-review your fix-push. Only post `/copilot review` if you introduced substantial new changes beyond addressing comments."
+        }
+        // `commented` (the common Copilot outcome) and any unknown state
+        // fall through to the same action: treat comments as asks, fix,
+        // push, merge. The anti-wait clause is the critical part.
+        _ => {
+            " | next: read comments (gh pr view <pr> / gh api repos/OWNER/REPO/pulls/<pr>/comments), fix ALL, push, then merge when CI green. Copilot reviews once per request — it will NOT auto re-review your fix-push. Only post `/copilot review` if you introduced substantial new changes beyond addressing comments."
+        }
+    }
+}
+
 /// Classify a parsed webhook payload. `event_type` is the value of the
 /// `X-GitHub-Event` header; `repo` is the bare repo name (no owner);
 /// `own_logins` is the list of GitHub logins representing "me" (your own
@@ -127,7 +149,11 @@ fn excerpt_body(body: &str) -> String {
 ///   * `pull_request_review submitted`/`edited` → `code-review-complete`
 ///     with truncated `review.body` excerpt so the session sees whether the
 ///     reviewer left substantive comments (vs. just an empty "commented"
-///     review) without a round-trip. `dismissed` is dropped (withdrawn).
+///     review) without a round-trip. A `| next: …` action hint is appended
+///     (verb tailored to review state) so the session cannot silently
+///     wait for a second Copilot review that will never come — Copilot
+///     reviews once per explicit request, never auto re-reviews a push.
+///     `dismissed` is dropped (withdrawn).
 ///   * `pull_request_review_comment created` → `review-comment` with file
 ///     path, line number, and body excerpt. Critical pairing with the
 ///     review wake: Copilot often posts per-line nitpicks whose content
@@ -262,9 +288,10 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let excerpt = excerpt_body(body);
+            let hint = next_action_hint(state);
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state} action={action}{excerpt}"
+                    "ghnotify code-review-complete: repo={repo} pr={pr} reviewer={reviewer} state={state} action={action}{excerpt}{hint}"
                 ),
             }
         }
@@ -496,9 +523,17 @@ mod tests {
             "pull_request": {"number": 123},
         });
         let d = classify("pull_request_review", &payload, "GitHub.Issues", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify code-review-complete: repo=GitHub.Issues pr=123 reviewer=copilot[bot] state=commented action=submitted"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=GitHub.Issues pr=123 reviewer=copilot[bot] state=commented action=submitted"
+            ),
+            "prefix wrong: {prompt}"
+        );
+        assert!(prompt.contains(" | next: "), "hint missing: {prompt}");
+        assert!(
+            prompt.contains("will NOT auto re-review"),
+            "anti-wait clause missing: {prompt}"
         );
     }
 
@@ -512,10 +547,14 @@ mod tests {
             "pull_request": {"number": 361},
         });
         let d = classify("pull_request_review", &payload, "GitHub.Issues", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify code-review-complete: repo=GitHub.Issues pr=361 reviewer=copilot-pull-request-reviewer state=commented action=edited"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=GitHub.Issues pr=361 reviewer=copilot-pull-request-reviewer state=commented action=edited"
+            ),
+            "prefix wrong: {prompt}"
         );
+        assert!(prompt.contains(" | next: "));
     }
 
     #[test]
@@ -548,9 +587,21 @@ mod tests {
             "pull_request": {"number": 42},
         });
         let d = classify("pull_request_review", &payload, "cr", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=42 reviewer=human-reviewer state=approved action=submitted"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=cr pr=42 reviewer=human-reviewer state=approved action=submitted"
+            ),
+            "prefix wrong: {prompt}"
+        );
+        // approved → merge-now hint, NOT the read-and-fix hint.
+        assert!(
+            prompt.contains("merge now"),
+            "approved merge hint missing: {prompt}"
+        );
+        assert!(
+            !prompt.contains("fix ALL"),
+            "approved must not tell me to fix anything: {prompt}"
         );
     }
 
@@ -562,9 +613,17 @@ mod tests {
             "pull_request": {"number": 7},
         });
         let d = classify("pull_request_review", &payload, "cr", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=7 reviewer=strict-reviewer state=changes_requested action=submitted"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=cr pr=7 reviewer=strict-reviewer state=changes_requested action=submitted"
+            ),
+            "prefix wrong: {prompt}"
+        );
+        assert!(prompt.contains("fix every item"), "hint wrong: {prompt}");
+        assert!(
+            prompt.contains("will NOT auto re-review"),
+            "anti-wait clause missing: {prompt}"
         );
     }
 
@@ -574,10 +633,14 @@ mod tests {
         // a usable prompt with "?" sentinels.
         let payload = json!({"action": "submitted"});
         let d = classify("pull_request_review", &payload, "cr", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify code-review-complete: repo=cr pr=? reviewer=? state=? action=submitted"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify code-review-complete: repo=cr pr=? reviewer=? state=? action=submitted"
+            ),
+            "prefix wrong: {prompt}"
         );
+        assert!(prompt.contains(" | next: "), "hint missing: {prompt}");
     }
 
     #[test]
@@ -793,17 +856,20 @@ mod tests {
         });
         let d = classify("pull_request_review", &payload, "cr", &[]);
         let prompt = forward(&d).expect("forwarded");
-        assert!(prompt.ends_with("…\""), "no ellipsis: {prompt}");
         // Ellipsis is budgeted inside the 200-char cap: 199 x chars + `…` =
-        // 200 chars total inside the quotes, not 201.
-        assert!(
-            prompt.contains(&format!(" body=\"{}…\"", "x".repeat(199))),
-            "excerpt shape wrong: {prompt}"
-        );
-        // Locked in: extract the body excerpt and count its chars.
-        let start = prompt.find(" body=\"").unwrap() + " body=\"".len();
-        let end = prompt.len() - 1; // trailing "
-        let excerpt = &prompt[start..end];
+        // 200 chars total inside the quotes, not 201. The body excerpt is
+        // followed by the next-action hint.
+        let marker = format!(" body=\"{}…\"", "x".repeat(199));
+        assert!(prompt.contains(&marker), "excerpt shape wrong: {prompt}");
+        // Locked in: extract the body excerpt between the opening quote and
+        // its matching closing quote (followed by ` | next: `) and count
+        // the chars.
+        let body_open = prompt.find(" body=\"").unwrap() + " body=\"".len();
+        let body_close = prompt[body_open..]
+            .find("\" | next: ")
+            .map(|i| body_open + i)
+            .expect("body close before hint");
+        let excerpt = &prompt[body_open..body_close];
         assert_eq!(
             excerpt.chars().count(),
             200,
@@ -966,6 +1032,67 @@ mod tests {
             let prompt = forward(&d).expect("forwarded");
             assert!(!prompt.contains("body="), "body leaked: {prompt}");
         }
+    }
+
+    #[test]
+    fn pr_review_hint_varies_by_state() {
+        // Commented / changes_requested / unknown → fix+push+merge, no wait.
+        // Approved → merge now, no further review.
+        for state in ["commented", "changes_requested", "weird-future-state"] {
+            let payload = json!({
+                "action": "submitted",
+                "review": {"user": {"login": "r"}, "state": state},
+                "pull_request": {"number": 1},
+            });
+            let d = classify("pull_request_review", &payload, "cr", &[]);
+            let prompt = forward(&d).expect("forwarded");
+            assert!(
+                prompt.contains("will NOT auto re-review"),
+                "{state}: anti-wait clause missing: {prompt}"
+            );
+            assert!(
+                prompt.contains("push") && prompt.contains("merge"),
+                "{state}: fix/push/merge verbs missing: {prompt}"
+            );
+        }
+        // Approved: no "fix" instruction, just merge.
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "r"}, "state": "approved"},
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.contains("merge now"),
+            "approved hint wrong: {prompt}"
+        );
+        assert!(
+            !prompt.contains("fix ALL") && !prompt.contains("fix every item"),
+            "approved must not prescribe fixes: {prompt}"
+        );
+        assert!(
+            prompt.contains("do not wait"),
+            "approved must still tell me not to wait: {prompt}"
+        );
+    }
+
+    #[test]
+    fn pr_review_hint_mentions_copilot_review_slash_command() {
+        // The hint is the last line of defense against the "wait for Copilot
+        // re-review" anti-pattern. It must tell the reader how to explicitly
+        // request a re-review when (and only when) it's actually warranted.
+        let payload = json!({
+            "action": "submitted",
+            "review": {"user": {"login": "r"}, "state": "commented"},
+            "pull_request": {"number": 1},
+        });
+        let d = classify("pull_request_review", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.contains("/copilot review"),
+            "re-review escape hatch missing: {prompt}"
+        );
     }
 
     #[test]
