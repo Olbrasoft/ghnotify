@@ -106,6 +106,18 @@ fn excerpt_body(body: &str) -> String {
     format!(" body=\"{excerpt}\"")
 }
 
+/// Common default-branch names, used by the CI hint to distinguish a
+/// post-merge aggregate wake ("idle or deploy") from a PR-fix-push wake
+/// ("merge now"). Hard-coded rather than configurable because (a) these
+/// three cover the overwhelming majority of repos, (b) misclassifying a
+/// non-default branch only demotes the hint from the post-merge variant
+/// to the safe no-action fallback, which is graceful. A repo with an
+/// exotic default branch name would still get a usable (if less precise)
+/// hint.
+fn is_likely_default_branch(head_branch: &str) -> bool {
+    matches!(head_branch, "main" | "master" | "trunk")
+}
+
 /// Concrete next-step instruction appended to the `ci-success` / `ci-failure`
 /// wake. Without it sessions idle after a fix-push ("maybe Copilot will
 /// re-review?") or diagnose-and-stop on failures ("it's pre-existing,
@@ -114,20 +126,24 @@ fn excerpt_body(body: &str) -> String {
 ///
 /// The branching matters: a CI wake on a **feature branch with a PR**
 /// means merge-now (if comments addressed) or push-fix-push (if
-/// CI failed). A CI wake on **main with no PR** is the post-merge
-/// aggregate — no action unless deploy fires.
+/// CI failed). A CI wake on the **default branch with no PR** is the
+/// post-merge aggregate — no action unless deploy fires.
 fn ci_next_action_hint(is_failure: bool, pr_str: &str, head_branch: &str) -> &'static str {
     if is_failure {
-        return " | next: CI failed — this wake is a call to action, not a report. Read failing check logs (gh run view / gh api), diagnose, fix, push. Do NOT stop at 'pre-existing, skip' — if it's truly unrelated, confirm on main and open a separate issue before closing this wake.";
+        return " | next: CI failed — this wake is a call to action, not a report. Read failing check logs (gh run view / gh api), diagnose, fix, push. Do NOT stop at 'pre-existing, skip' — if it's truly unrelated, confirm on the default branch and open a separate issue before closing this wake.";
     }
     let has_pr = !pr_str.is_empty() && pr_str != "none";
-    let on_main = head_branch == "main" || head_branch == "master";
-    match (has_pr, on_main) {
+    let on_default_branch = is_likely_default_branch(head_branch);
+    match (has_pr, on_default_branch) {
         (true, _) => {
-            " | next: CI green on open PR. If Copilot already reviewed and you addressed comments in this push → merge NOW (gh pr merge <pr> --squash --delete-branch). Copilot will NOT auto re-review; do not wait. If no review yet → request one (`/copilot review` comment) only if substantive, otherwise merge directly."
+            // `--delete-branch` is only safe for a regular feature-branch
+            // head; dropping it from the default invocation avoids "cannot
+            // delete protected branch" errors on the rare PR whose head is
+            // a protected branch. The session can append it when safe.
+            " | next: CI green on open PR. If Copilot already reviewed and you addressed comments in this push → merge NOW (gh pr merge <pr> --squash; append --delete-branch only if the head branch is safe to delete). Copilot will NOT auto re-review; do not wait. If no review yet → request one (`/copilot review` comment) only if substantive, otherwise merge directly."
         }
         (false, true) => {
-            " | next: post-merge CI green on main. If this repo has a deploy workflow, the deploy/verify wake will follow — idle until then. Otherwise the workflow is complete; close underlying issue if applicable."
+            " | next: post-merge CI green on the default branch. If this repo has a deploy workflow, the deploy/verify wake will follow — idle until then. Otherwise the workflow is complete; close underlying issue if applicable."
         }
         // Branch without a PR linkage (weird — direct push to a feature
         // branch, or check_suite arrived before PR was opened). Safe fallback.
@@ -577,24 +593,67 @@ mod tests {
     }
 
     #[test]
-    fn ci_success_on_main_has_post_merge_hint() {
-        // Post-merge CI wakes (pr=none, branch=main) should NOT tell the
+    fn ci_success_on_default_branch_has_post_merge_hint() {
+        // Post-merge CI wakes (pr=none, branch=default) should NOT tell the
         // session to merge — there is nothing to merge. Idle-or-deploy hint.
+        // Covers the three common default-branch names; an exotic default
+        // (e.g. `develop`) falls through to the safe fallback variant —
+        // that's acceptable degradation, the other test below locks it in.
+        for branch in ["main", "master", "trunk"] {
+            let payload = json!({
+                "action": "completed",
+                "check_suite": {
+                    "conclusion": "success",
+                    "head_sha": "11112222",
+                    "head_branch": branch,
+                    "pull_requests": [],
+                },
+            });
+            let d = classify("check_suite", &payload, "cr", &[]);
+            let prompt = forward(&d).expect("forwarded");
+            assert!(
+                prompt.contains("post-merge"),
+                "{branch}: post-merge hint missing: {prompt}"
+            );
+            assert!(
+                prompt.contains("default branch"),
+                "{branch}: default-branch wording missing: {prompt}"
+            );
+            assert!(
+                !prompt.contains("merge NOW"),
+                "{branch}: must not say merge-now on default branch: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_success_pr_merge_hint_omits_delete_branch_by_default() {
+        // `--delete-branch` was previously hard-coded in the hint, which
+        // fails on PRs whose head is a protected branch. Now the default
+        // hint drops it; the session can append it when safe.
         let payload = json!({
             "action": "completed",
             "check_suite": {
                 "conclusion": "success",
-                "head_sha": "11112222",
-                "head_branch": "main",
-                "pull_requests": [],
+                "head_sha": "abc12345",
+                "head_branch": "feat/foo",
+                "pull_requests": [{"number": 1}],
             },
         });
         let d = classify("check_suite", &payload, "cr", &[]);
         let prompt = forward(&d).expect("forwarded");
-        assert!(prompt.contains("post-merge"), "hint wrong: {prompt}");
         assert!(
-            !prompt.contains("merge NOW"),
-            "must not say merge-now on main: {prompt}"
+            prompt.contains("--squash"),
+            "squash flag missing from hint: {prompt}"
+        );
+        assert!(
+            prompt.contains("append --delete-branch only if"),
+            "delete-branch must be conditional: {prompt}"
+        );
+        // Regression guard: no unconditional `--squash --delete-branch`.
+        assert!(
+            !prompt.contains("--squash --delete-branch"),
+            "unconditional --delete-branch leaked back into hint: {prompt}"
         );
     }
 
