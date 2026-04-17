@@ -106,6 +106,53 @@ fn excerpt_body(body: &str) -> String {
     format!(" body=\"{excerpt}\"")
 }
 
+/// Common default-branch names, used by the CI hint to distinguish a
+/// post-merge aggregate wake ("idle or deploy") from a PR-fix-push wake
+/// ("merge now"). Hard-coded rather than configurable because (a) these
+/// three cover the overwhelming majority of repos, (b) misclassifying a
+/// non-default branch only demotes the hint from the post-merge variant
+/// to the safe no-action fallback, which is graceful. A repo with an
+/// exotic default branch name would still get a usable (if less precise)
+/// hint.
+fn is_likely_default_branch(head_branch: &str) -> bool {
+    matches!(head_branch, "main" | "master" | "trunk")
+}
+
+/// Concrete next-step instruction appended to the `ci-success` / `ci-failure`
+/// wake. Without it sessions idle after a fix-push ("maybe Copilot will
+/// re-review?") or diagnose-and-stop on failures ("it's pre-existing,
+/// skipping"). Both are wrong: a wake is a call to action. The hint
+/// removes all ambiguity about what to do next.
+///
+/// The branching matters: a CI wake on a **feature branch with a PR**
+/// means merge-now (if comments addressed) or push-fix-push (if
+/// CI failed). A CI wake on the **default branch with no PR** is the
+/// post-merge aggregate — no action unless deploy fires.
+fn ci_next_action_hint(is_failure: bool, pr_str: &str, head_branch: &str) -> &'static str {
+    if is_failure {
+        return " | next: CI failed — this wake is a call to action, not a report. Read failing check logs (gh run view / gh api), diagnose, fix, push. Do NOT stop at 'pre-existing, skip' — if it's truly unrelated, confirm on the default branch and open a separate issue before closing this wake.";
+    }
+    let has_pr = !pr_str.is_empty() && pr_str != "none";
+    let on_default_branch = is_likely_default_branch(head_branch);
+    match (has_pr, on_default_branch) {
+        (true, _) => {
+            // `--delete-branch` is only safe for a regular feature-branch
+            // head; dropping it from the default invocation avoids "cannot
+            // delete protected branch" errors on the rare PR whose head is
+            // a protected branch. The session can append it when safe.
+            " | next: CI green on open PR. If Copilot already reviewed and you addressed comments in this push → merge NOW (gh pr merge <pr> --squash; append --delete-branch only if the head branch is safe to delete). Copilot will NOT auto re-review; do not wait. If no review yet → request one (`/copilot review` comment) only if substantive, otherwise merge directly."
+        }
+        (false, true) => {
+            " | next: post-merge CI green on the default branch. If this repo has a deploy workflow, the deploy/verify wake will follow — idle until then. Otherwise the workflow is complete; close underlying issue if applicable."
+        }
+        // Branch without a PR linkage (weird — direct push to a feature
+        // branch, or check_suite arrived before PR was opened). Safe fallback.
+        (false, false) => {
+            " | next: CI green. If this commit backs an open PR not yet linked, proceed to merge once the PR appears; otherwise no further action."
+        }
+    }
+}
+
 /// Concrete next-step instruction appended to the `code-review-complete`
 /// wake. Without it sessions loop on wishful thinking ("surely Copilot will
 /// re-review my fix-push") and hang indefinitely; Copilot only reviews once
@@ -141,11 +188,15 @@ fn next_action_hint(state: &str) -> &'static str {
 /// Forwarding rules:
 ///   * `check_suite completed` is the one reliable CI aggregate. Success →
 ///     `ci-success` (decide whether to merge); failure/cancelled/timed_out →
-///     `ci-failure` (fix it). Non-terminal actions are dropped. The
-///     parallel check_suite that GitHub dispatches on the synthetic
-///     `refs/pull/N/…` ref for every PR is dropped — the branch-named
-///     pair is strictly more informative and forwarding both means the
-///     session is woken twice per CI run.
+///     `ci-failure` (fix it). A `| next: …` action hint is appended that
+///     branches on PR-vs-main: on a feature branch with a PR it says
+///     merge-now (Copilot will not auto re-review the fix-push); on main
+///     it acknowledges post-merge aggregate; on failure it is an explicit
+///     "diagnose and fix" (NOT "diagnose and stop at pre-existing").
+///     Non-terminal actions are dropped. The parallel check_suite that
+///     GitHub dispatches on the synthetic `refs/pull/N/…` ref for every
+///     PR is dropped — the branch-named pair is strictly more informative
+///     and forwarding both means the session is woken twice per CI run.
 ///   * `pull_request_review submitted`/`edited` → `code-review-complete`
 ///     with truncated `review.body` excerpt so the session sees whether the
 ///     reviewer left substantive comments (vs. just an empty "commented"
@@ -242,14 +293,16 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 prs.join(",")
             };
             let head_short = head_sha.get(..8).unwrap_or(head_sha);
-            let kind = if conclusion == "success" {
-                "ci-success"
-            } else {
+            let is_failure = conclusion != "success";
+            let kind = if is_failure {
                 "ci-failure"
+            } else {
+                "ci-success"
             };
+            let hint = ci_next_action_hint(is_failure, &pr_str, head_branch);
             Decision::Forward {
                 prompt: format!(
-                    "ghnotify {kind}: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}"
+                    "ghnotify {kind}: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}{hint}"
                 ),
             }
         }
@@ -474,9 +527,17 @@ mod tests {
             },
         });
         let d = classify("check_suite", &payload, "cr", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify ci-success: repo=cr status=success pr=476,477 branch=feat/foo head=abc12345"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify ci-success: repo=cr status=success pr=476,477 branch=feat/foo head=abc12345"
+            ),
+            "prefix wrong: {prompt}"
+        );
+        // Feature branch + PR → merge-now hint.
+        assert!(
+            prompt.contains("merge NOW"),
+            "merge-now hint missing: {prompt}"
         );
     }
 
@@ -492,9 +553,21 @@ mod tests {
             },
         });
         let d = classify("check_suite", &payload, "cr", &[]);
-        assert_eq!(
-            forward(&d),
-            Some("ghnotify ci-failure: repo=cr status=failure pr=none branch=main head=deadbeef"),
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.starts_with(
+                "ghnotify ci-failure: repo=cr status=failure pr=none branch=main head=deadbeef"
+            ),
+            "prefix wrong: {prompt}"
+        );
+        // Failure → call to action, anti-"diagnose and stop" clause.
+        assert!(
+            prompt.contains("call to action"),
+            "call-to-action clause missing: {prompt}"
+        );
+        assert!(
+            prompt.contains("pre-existing"),
+            "anti-skip clause missing: {prompt}"
         );
     }
 
@@ -512,7 +585,128 @@ mod tests {
         let d = classify("check_suite", &payload, "cr", &[]);
         // cancelled / timed_out / action_required all classify as ci-failure
         // (something actionable went wrong).
-        assert!(forward(&d).unwrap().starts_with("ghnotify ci-failure:"));
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.starts_with("ghnotify ci-failure:"));
+        // Same anti-skip clause for cancelled (it's still a failure from the
+        // session's perspective — something needs attention).
+        assert!(prompt.contains("call to action"), "{prompt}");
+    }
+
+    #[test]
+    fn ci_success_on_default_branch_has_post_merge_hint() {
+        // Post-merge CI wakes (pr=none, branch=default) should NOT tell the
+        // session to merge — there is nothing to merge. Idle-or-deploy hint.
+        // Covers the three common default-branch names; an exotic default
+        // (e.g. `develop`) falls through to the safe fallback variant —
+        // that's acceptable degradation, the other test below locks it in.
+        for branch in ["main", "master", "trunk"] {
+            let payload = json!({
+                "action": "completed",
+                "check_suite": {
+                    "conclusion": "success",
+                    "head_sha": "11112222",
+                    "head_branch": branch,
+                    "pull_requests": [],
+                },
+            });
+            let d = classify("check_suite", &payload, "cr", &[]);
+            let prompt = forward(&d).expect("forwarded");
+            assert!(
+                prompt.contains("post-merge"),
+                "{branch}: post-merge hint missing: {prompt}"
+            );
+            assert!(
+                prompt.contains("default branch"),
+                "{branch}: default-branch wording missing: {prompt}"
+            );
+            assert!(
+                !prompt.contains("merge NOW"),
+                "{branch}: must not say merge-now on default branch: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_success_pr_merge_hint_omits_delete_branch_by_default() {
+        // `--delete-branch` was previously hard-coded in the hint, which
+        // fails on PRs whose head is a protected branch. Now the default
+        // hint drops it; the session can append it when safe.
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_sha": "abc12345",
+                "head_branch": "feat/foo",
+                "pull_requests": [{"number": 1}],
+            },
+        });
+        let d = classify("check_suite", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(
+            prompt.contains("--squash"),
+            "squash flag missing from hint: {prompt}"
+        );
+        assert!(
+            prompt.contains("append --delete-branch only if"),
+            "delete-branch must be conditional: {prompt}"
+        );
+        // Regression guard: no unconditional `--squash --delete-branch`.
+        assert!(
+            !prompt.contains("--squash --delete-branch"),
+            "unconditional --delete-branch leaked back into hint: {prompt}"
+        );
+    }
+
+    #[test]
+    fn ci_success_on_feature_branch_without_pr_has_safe_fallback_hint() {
+        // Direct push to a feature branch with no PR opened yet — don't
+        // fabricate a merge instruction (there is nothing to merge).
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_sha": "33334444",
+                "head_branch": "wip/experiment",
+                "pull_requests": [],
+            },
+        });
+        let d = classify("check_suite", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.contains(" | next: "), "hint missing: {prompt}");
+        assert!(
+            !prompt.contains("merge NOW"),
+            "must not fabricate merge: {prompt}"
+        );
+    }
+
+    #[test]
+    fn ci_failure_hint_forbids_diagnose_and_stop() {
+        // Regression guard: user explicitly called out that "it's pre-existing,
+        // skip" is unacceptable. The hint must say a failure wake is a call
+        // to action, and must include the literal anti-skip clause so future
+        // rewrites can't silently drop it.
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "failure",
+                "head_sha": "deadbeef",
+                "head_branch": "feat/x",
+                "pull_requests": [{"number": 7}],
+            },
+        });
+        let d = classify("check_suite", &payload, "cr", &[]);
+        let prompt = forward(&d).expect("forwarded");
+        assert!(prompt.contains("call to action"), "{prompt}");
+        assert!(
+            prompt.contains("pre-existing"),
+            "anti-skip clause missing: {prompt}"
+        );
+        // Failure hint is identical regardless of PR/branch — a failure is
+        // a failure. The merge-now clause must NOT appear.
+        assert!(
+            !prompt.contains("merge NOW"),
+            "failure must not say merge: {prompt}"
+        );
     }
 
     #[test]
