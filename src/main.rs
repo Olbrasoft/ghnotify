@@ -132,14 +132,21 @@ async fn main() -> Result<()> {
             webhook::serve(cfg, bind, one_shot).await
         }
         Command::Send { repo, prompt } => {
-            let session = tmux::session_name_for_repo(&repo);
+            let base = tmux::session_name_for_repo(&repo);
+            let session = match sessions::resolve_session_for_repo(&repo)? {
+                Some(s) => s,
+                None => {
+                    eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
+                    std::process::exit(2);
+                }
+            };
             match tmux::send_prompt(&session, &prompt)? {
                 tmux::Delivery::Delivered => {
                     println!("delivered prompt to tmux session: {session}");
                     Ok(())
                 }
                 tmux::Delivery::NoSession => {
-                    eprintln!("no tmux session named '{session}'. Use `ghnotify list` to see available sessions.");
+                    eprintln!("tmux session '{session}' disappeared before send. Use `ghnotify list` to see available sessions.");
                     std::process::exit(2);
                 }
             }
