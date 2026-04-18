@@ -8,7 +8,7 @@
 //! To support both layouts, we route by *prefix*: a webhook for repo `cr`
 //! matches either `claude-cr` or `claude-cr-<anything>`.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
 use crate::tmux;
@@ -44,7 +44,23 @@ pub fn list_claude_sessions_full() -> Result<Vec<SessionInfo>> {
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
-        Ok(_) => return Ok(Vec::new()), // no server / no sessions
+        Ok(o) => {
+            // Distinguish "tmux isn't running" (soft-empty, expected) from
+            // real failures (malformed -F spec on old tmux, permission
+            // issues, …). Without this split, webhook delivery would
+            // silently soft-discard every webhook whenever the format
+            // string regresses on some host, hiding the routing bug
+            // instead of surfacing it.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("no server running") {
+                return Ok(Vec::new());
+            }
+            return Err(anyhow!(
+                "tmux list-sessions failed ({}): {}",
+                o.status,
+                stderr.trim()
+            ));
+        }
         Err(e) => return Err(e).context("failed to spawn tmux"),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -282,22 +298,22 @@ claude-missing-field\t1
     }
 
     #[test]
-    fn pick_isolates_repos_with_shared_prefix_when_both_present() {
-        // Both "cr" and "cr-web" could coexist; ensure base="claude-cr" only
-        // pulls cr sessions, not cr-web ones (even though cr-web starts with
-        // "claude-cr-").
+    fn pick_prefers_newer_attached_session_among_shared_prefix_matches() {
+        // Prefix routing intentionally treats both the exact base session and
+        // any `base-...` suffixed variant as matches. That means a session
+        // like `claude-cr-web-pts-3` is also a candidate for base `claude-cr`
+        // because it starts with `claude-cr-`.
         //
-        // NOTE: This is a known ambiguity of prefix routing — a session named
-        // `claude-cr-web-pts-3` would match base `claude-cr`. In practice repo
-        // names don't collide this way at Olbrasoft, but the test documents
-        // the current behavior so any future change is intentional.
+        // This test documents that accepted ambiguity: once multiple sessions
+        // match by prefix, the normal selection rule still applies and the
+        // newer attached session wins. Olbrasoft repo names don't collide
+        // this way in practice (webhook repo field carries the actual repo
+        // name) — if that ever changes, this test fixes the current behavior
+        // so any rule change is intentional.
         let sessions = vec![
             s("claude-cr-web-pts-3", true, 100),
             s("claude-cr-pts-2", true, 200),
         ];
-        // The newer attached one wins. If cr-web were newer this would pick it,
-        // which would be wrong — we accept that tradeoff (webhook repo field
-        // carries the actual repo name so collisions are rare).
         assert_eq!(
             pick_session(&sessions, "claude-cr"),
             Some("claude-cr-pts-2".into())
