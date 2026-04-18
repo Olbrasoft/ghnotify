@@ -10,7 +10,7 @@
 //!     intended to be run per-connection under systemd socket activation so
 //!     nothing is running between webhook deliveries.
 
-use crate::{config::Config, event, tmux};
+use crate::{config::Config, event, sessions, tmux};
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
@@ -189,8 +189,35 @@ async fn process_webhook(
         }
     };
 
-    // 4. Dispatch to the matching tmux session.
-    let session = tmux::session_name_for_repo(repo_name);
+    // 4. Dispatch to the matching tmux session. Routing is prefix-aware so
+    //    tty-suffixed sessions (`claude-<repo>-<tty>`) from shells that
+    //    disambiguate per-terminal still receive webhooks.
+    let base = tmux::session_name_for_repo(repo_name);
+    let session = match sessions::resolve_session_for_repo(repo_name) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            info!(
+                base,
+                event_type, "no claude session for repo, event discarded"
+            );
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "discarded": true,
+                    "reason": "no claude session running for this repo",
+                    "session": base,
+                })),
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "failed to list tmux sessions");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            );
+        }
+    };
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
             info!(session, event_type, "prompt delivered");
@@ -199,20 +226,19 @@ async fn process_webhook(
                 Json(serde_json::json!({ "ok": true, "session": session })),
             )
         }
-        // No session for this repo → soft discard. Webhook senders do not
-        // retry on non-2xx anyway, but we return 200 so logs stay clean:
-        // there is nothing wrong, there is just no one home to wake up.
+        // Session vanished between list and send (rare race). Treat as soft
+        // discard for the same reason the caller-less case is a soft discard.
         Ok(tmux::Delivery::NoSession) => {
             info!(
                 session,
-                event_type, "no claude session for repo, event discarded"
+                event_type, "session disappeared before send, event discarded"
             );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
                     "discarded": true,
-                    "reason": "no claude session running for this repo",
+                    "reason": "session disappeared before send",
                     "session": session,
                 })),
             )
