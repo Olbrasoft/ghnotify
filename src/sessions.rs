@@ -243,10 +243,7 @@ claude-missing-field\t1
     fn pick_prefers_attached_over_orphan_exact() {
         // Old orphan claude-cr (unattached) vs. live claude-cr-pts-2 (attached)
         // — the real-world bug this fix addresses.
-        let sessions = vec![
-            s("claude-cr", false, 100),
-            s("claude-cr-pts-2", true, 200),
-        ];
+        let sessions = vec![s("claude-cr", false, 100), s("claude-cr-pts-2", true, 200)];
         assert_eq!(
             pick_session(&sessions, "claude-cr"),
             Some("claude-cr-pts-2".into())
@@ -268,10 +265,7 @@ claude-missing-field\t1
 
     #[test]
     fn pick_falls_back_to_unattached_when_nothing_attached() {
-        let sessions = vec![
-            s("claude-cr", false, 100),
-            s("claude-cr-pts-2", false, 200),
-        ];
+        let sessions = vec![s("claude-cr", false, 100), s("claude-cr-pts-2", false, 200)];
         assert_eq!(
             pick_session(&sessions, "claude-cr"),
             Some("claude-cr-pts-2".into())
