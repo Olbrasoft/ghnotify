@@ -56,31 +56,6 @@ pub enum CiAggregate {
     InProgress,
 }
 
-/// Exactly-shaped test for GitHub's PR-synthetic check_suite refs:
-/// `refs/pull/<digits>/head` or `refs/pull/<digits>/merge`. A plain prefix
-/// match on `refs/pull/` would over-match any user-authored branch
-/// happening to share that prefix; the stricter shape avoids that over-
-/// match and rules out the obvious lookalikes (`refs/pulls/…`,
-/// `refs/pull/4/patch`, non-numeric segment, extra trailing path). A
-/// user who deliberately names a branch exactly
-/// `refs/pull/<digits>/(head|merge)` would still be suppressed — that
-/// collision is accepted as the cost of deduplicating the paired wake
-/// for the overwhelmingly common case. The check_suite payload carries
-/// no field that would distinguish a user's branch-push from GitHub's
-/// synthetic-ref dispatch once the shape matches.
-fn is_refs_pull_synthetic(head_branch: &str) -> bool {
-    let Some(rest) = head_branch.strip_prefix("refs/pull/") else {
-        return false;
-    };
-    let Some((num, tail)) = rest.split_once('/') else {
-        return false;
-    };
-    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    matches!(tail, "head" | "merge")
-}
-
 /// Trim, sanitize, and truncate a review/comment body for inclusion in the
 /// wake prompt. Empty → empty string; otherwise returns ` body="<excerpt>"`.
 ///
@@ -231,10 +206,13 @@ fn next_action_hint(state: &str) -> &'static str {
 ///     merge-now (Copilot will not auto re-review the fix-push); on main
 ///     it acknowledges post-merge aggregate; on failure it is an explicit
 ///     "diagnose and fix" (NOT "diagnose and stop at pre-existing").
-///     Non-terminal actions are dropped. The parallel check_suite that
-///     GitHub dispatches on the synthetic `refs/pull/N/…` ref for every
-///     PR is dropped — the branch-named pair is strictly more informative
-///     and forwarding both means the session is woken twice per CI run.
+///     Non-terminal actions are dropped. **Both** the branch-named and
+///     the synthetic `refs/pull/N/…` check_suite for a PR are
+///     forwarded; duplicate wakes are prevented downstream by
+///     `webhook::refine_ci_decision`, which only fires once every
+///     suite on the head SHA has completed. Filtering the synthetic
+///     here would silently lose the wake when it happens to be the
+///     last suite to finish — which it commonly is.
 ///   * `pull_request_review submitted`/`edited` → `code-review-complete`
 ///     with truncated `review.body` excerpt so the session sees whether the
 ///     reviewer left substantive comments (vs. just an empty "commented"
@@ -273,37 +251,21 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
         },
 
         "check_suite" if action == "completed" => {
-            let head_branch = payload
-                .pointer("/check_suite/head_branch")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
             // GitHub dispatches a parallel check_suite on the synthetic
-            // `refs/pull/N/head` (and sometimes `refs/pull/N/merge`) ref for
-            // every PR, in addition to the one for the PR's actual branch
-            // name (e.g. `fix/foo`). Both fire for the same head_sha, so
-            // forwarding both means the session gets two ci-success/failure
-            // wakes for every PR CI run. The named-branch one is strictly
-            // more informative (carries the real branch name + pr numbers
-            // together), so drop the synthetic ref to keep 1 wake per run.
-            // Post-merge redelivery of the synthetic ref is the specific
-            // case that used to look like "a late duplicate wake arriving
-            // after merge" — it's not late, it's just the second of the
-            // pair completing.
-            //
-            // The predicate matches the exact shape
-            // `refs/pull/<digits>/(head|merge)` rather than a naive
-            // prefix check, which rules out the common lookalikes
-            // (`refs/pulls/…`, `refs/pull/4/patch`, non-numeric middle,
-            // extra trailing path). A user deliberately naming a
-            // branch exactly `refs/pull/<digits>/(head|merge)` would
-            // still be suppressed — see the docstring on
-            // `is_refs_pull_synthetic` for why that residual collision
-            // is accepted.
-            if is_refs_pull_synthetic(head_branch) {
-                return Decision::Drop {
-                    reason: "check_suite on refs/pull/ synthetic ref (pair-dup of branch-named check_suite)",
-                };
-            }
+            // `refs/pull/N/head` (and sometimes `refs/pull/N/merge`) ref
+            // for every PR, in addition to the one for the PR's actual
+            // branch name (e.g. `fix/foo`). An earlier iteration of
+            // this classifier dropped the synthetic to prevent
+            // duplicate wakes, but `webhook::refine_ci_decision` now
+            // defers every check_suite completion until every suite on
+            // the head SHA is done and forwards exactly one aggregate
+            // wake. Dropping the synthetic here would prevent its
+            // completion from ever triggering the aggregate check —
+            // and in practice the synthetic is often the LAST suite
+            // to complete, so filtering it at this layer would silently
+            // lose the wake entirely. Let both events through; the
+            // aggregate check keeps duplicates down to the rare
+            // fail-open race.
             let conclusion = payload
                 .pointer("/check_suite/conclusion")
                 .and_then(Value::as_str)
@@ -1215,11 +1177,16 @@ mod tests {
     }
 
     #[test]
-    fn check_suite_on_refs_pull_synthetic_ref_is_dropped() {
-        // GitHub dispatches a parallel check_suite for every PR on the
-        // synthetic `refs/pull/N/head` ref, in addition to the one on the
-        // PR's branch name. Forwarding both wakes the session twice for
-        // the same CI run. Drop the synthetic-ref one.
+    fn check_suite_on_refs_pull_synthetic_ref_is_still_forwarded() {
+        // An earlier version of the classifier dropped check_suite events
+        // on `refs/pull/<N>/head|merge` synthetic refs to prevent duplicate
+        // wakes. `webhook::refine_ci_decision` now defers until every
+        // suite on the head SHA is complete and forwards exactly one
+        // aggregate wake — and the synthetic is often the LAST suite to
+        // finish, so dropping it here would silently lose the entire
+        // CI run's wake. Regression guard: synthetic refs must reach
+        // classify's Forward path so their completion can trigger the
+        // aggregate check.
         for head_branch in ["refs/pull/4/head", "refs/pull/123/merge"] {
             let payload = json!({
                 "action": "completed",
@@ -1230,53 +1197,16 @@ mod tests {
                     "pull_requests": [],
                 },
             });
-            assert!(
-                matches!(
-                    classify("check_suite", &payload, "ghnotify", &[]),
-                    Decision::Drop { .. }
-                ),
-                "refs/pull/ head_branch {head_branch} should be dropped",
-            );
-        }
-    }
-
-    #[test]
-    fn check_suite_refs_pull_lookalikes_are_not_dropped_by_synthetic_filter() {
-        // The filter must match the exact shape `refs/pull/<digits>/(head|merge)`
-        // — a plain `starts_with("refs/pull/")` would over-match any
-        // user-authored branch sharing the prefix. Legitimate (if unusual)
-        // branch names below must still reach the forward path.
-        for head_branch in [
-            "refs/pull/foo",           // no trailing /head or /merge
-            "refs/pull/foo/bar",       // non-numeric "number"
-            "refs/pull/4/patch",       // wrong tail segment
-            "refs/pull//head",         // empty number
-            "refs/pull/4/head/extra",  // trailing path component
-            "refs/pulls/4/head",       // wrong prefix spelling
-            "refs/pull-custom/4/head", // prefix not matching exactly
-        ] {
-            let payload = json!({
-                "action": "completed",
-                "check_suite": {
-                    "conclusion": "success",
-                    "head_sha": "abc12345",
-                    "head_branch": head_branch,
-                    "pull_requests": [],
-                },
-            });
             let d = classify("check_suite", &payload, "ghnotify", &[]);
             assert!(
                 matches!(d, Decision::Forward { .. }),
-                "lookalike {head_branch:?} should NOT be filtered as synthetic",
+                "synthetic ref {head_branch:?} must Forward (aggregate decides duplicates)",
             );
         }
     }
 
     #[test]
-    fn check_suite_on_named_branch_is_still_forwarded() {
-        // Guard against over-filtering: a genuine feature-branch
-        // check_suite must continue to wake the session. Only the
-        // refs/pull/… synthetic-ref variant is suppressed.
+    fn check_suite_on_named_branch_is_forwarded() {
         let payload = json!({
             "action": "completed",
             "check_suite": {

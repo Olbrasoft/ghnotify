@@ -193,7 +193,9 @@ async fn process_webhook(
     };
 
     // 3. Classify: should we forward this event at all, and as what prompt?
-    let prompt = match event::classify(
+    //    The single-event prompt produced here may be superseded by the
+    //    aggregate-refined prompt below for `check_suite` events.
+    let single_event_prompt = match event::classify(
         event_type,
         &payload,
         repo_name,
@@ -226,11 +228,12 @@ async fn process_webhook(
     // 3a. For check_suite wakes, defer until every check_suite on the head
     //     SHA is complete so a single App (typically GitGuardian, which
     //     tends to finish seconds ahead of the real CI suite) can't fire
-    //     a premature `ci-success`. Fails open on gh errors — better a
-    //     possibly-early wake than a silently-dropped one.
+    //     a premature `ci-success`. Fails open to `single_event_prompt`
+    //     on gh errors — better a possibly-early wake than a
+    //     silently-dropped one.
     let prompt = match event_type {
         "check_suite" => match refine_ci_decision(&payload, repo_name).await {
-            CiRefinement::ForwardAs(p) => p,
+            CiRefinement::ForwardAs(aggregate_prompt) => aggregate_prompt,
             CiRefinement::Defer { reason } => {
                 info!(
                     event_type,
@@ -247,9 +250,9 @@ async fn process_webhook(
                     })),
                 );
             }
-            CiRefinement::FailOpen => prompt,
+            CiRefinement::FailOpen => single_event_prompt,
         },
-        _ => prompt,
+        _ => single_event_prompt,
     };
 
     // 4. Resolve target session. UUID-based first (correct across repos),
@@ -422,6 +425,21 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
         Some(s) => s,
         None => return CiRefinement::FailOpen,
     };
+    // An *empty* list from a successful gh call is genuinely ambiguous
+    // (eventual consistency, commit not yet propagated, jq shape
+    // change) — not the same as "every suite still in_progress". If
+    // we deferred on empty, no later event would re-trigger and the
+    // whole wake would vanish. Fail open to the single-event prompt
+    // instead so the session still hears about the completed suite
+    // that brought us here.
+    if suites.is_empty() {
+        warn!(
+            sha = info.head_sha,
+            repo = info.full_name,
+            "gh check-suites returned empty list; failing open to single-event prompt"
+        );
+        return CiRefinement::FailOpen;
+    }
     let aggregate = event::compute_ci_aggregate(
         suites
             .iter()
