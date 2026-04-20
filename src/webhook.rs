@@ -25,17 +25,17 @@
 //!      event's repo. This is the *only* correct answer when a session
 //!      runs in one directory but opens PRs in another (e.g. imdb
 //!      session → cr PR).
-//!   2. **By author UUID via `gh api`** — `check_suite` payloads only
-//!      carry PR numbers, not bodies. We look for the number first in
-//!      `check_suite.pull_requests[]` (branch-named events) and then
-//!      in `check_suite.head_branch` parsed as `refs/pull/<N>/(head|
-//!      merge)` (GitHub's synthetic-ref events, where the array is
-//!      typically empty). Either way we then fetch the PR body via
-//!      `gh api repos/OWNER/NAME/pulls/N` and extract the same marker,
-//!      so CI wakes — including the aggregate wake when the
-//!      synthetic-ref suite is the last to complete — land on the
-//!      pushing session. Gated on a short timeout so a stuck `gh`
-//!      (auth prompt, network stall) can't jam the webhook handler.
+//!   2. **By author UUID via `gh api`** — `check_suite` payloads
+//!      don't carry PR bodies, so we resolve them via `gh`. See
+//!      [`uuid_from_check_suite`] for the three payload shapes
+//!      covered (branch-named, synthetic-ref, post-merge default-
+//!      branch via commit → PR lookup). Without the commit-lookup
+//!      path, post-merge `ci-success branch=main pr=none` wakes fell
+//!      into repo-based routing and landed on whichever session had
+//!      the repo's cwd open, even when that session had nothing to
+//!      do with the PR. All calls are gated on a short timeout so a
+//!      stuck `gh` (auth prompt, network stall) can't jam the
+//!      webhook handler.
 //!   3. **By repo name** — fall back to the prefix match on
 //!      `claude-<repo>` when the marker is absent, the session is
 //!      dead, or any of the lookups above fail. Preserves legacy
@@ -673,18 +673,23 @@ fn pr_number_from_head_branch(payload: &Value) -> Option<u64> {
 /// Fetch the PR body for the PR referenced by a check_suite event
 /// and extract the claude-session marker from it.
 ///
-/// Looks for the PR number in two places: first the `pull_requests`
-/// array on the check_suite, which carries it for branch-named
-/// check_suite events; then the `head_branch` itself, which for
-/// GitHub's synthetic `refs/pull/<N>/(head|merge)` dispatch carries
-/// the number even when `pull_requests` is empty. Without the
-/// fallback, the wake for the synthetic-ref suite (which is often
-/// the *last* suite to complete and therefore the one `refine_ci`
-/// forwards) falls back to repo-based routing — and lands on
-/// whichever session happens to have the event's repo open, not the
-/// author session that actually opened the PR. Reproduced on cr#536:
-/// the synthetic-ref `ci-success` wake went to `claude-cr-pts-4` even
-/// though the PR was opened from `claude-imdb-pts-2`.
+/// Covers three payload shapes:
+///   * **Branch-named PR event** — `pull_requests[]` has the PR
+///     number. Fetch body via `/pulls/N`.
+///   * **Synthetic-ref event** — `head_branch=refs/pull/<N>/(head|
+///     merge)` carries the number even when `pull_requests[]` is
+///     empty. Fetch body via `/pulls/N`.
+///   * **Post-merge main event** — `head_branch=main` (or master /
+///     trunk), `pull_requests[]=[]`, no PR number in either of the
+///     above. Fetch the body of the *originating* PR via
+///     `/commits/SHA/pulls` (GitHub still tracks which PR a squash/
+///     merge commit came from), so the post-merge wake routes back
+///     to the session that opened the PR instead of falling into
+///     repo-based routing and landing on whichever session happens
+///     to have the repo's cwd open. Reproduced on cr after
+///     merging #535/#536 — the `ci-success branch=main pr=none`
+///     wakes kept arriving at `claude-cr-pts-4` even though that
+///     session wasn't involved.
 ///
 /// Requires `gh` to be on PATH and authenticated. Returns `None` on any
 /// failure (spawn error, non-zero exit, empty body, timeout, missing
@@ -693,31 +698,78 @@ fn pr_number_from_head_branch(payload: &Value) -> Option<u64> {
 /// from the journal; silent `None`s used to hide "gh not on PATH"
 /// behind a generic repo-routing fallback.
 async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
-    let number = pr_number_from_payload(payload).or_else(|| pr_number_from_head_branch(payload))?;
     let full_name = payload
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
+    let body = if let Some(number) =
+        pr_number_from_payload(payload).or_else(|| pr_number_from_head_branch(payload))
+    {
+        fetch_pr_body_by_number(full_name, number).await?
+    } else {
+        let sha = payload
+            .pointer("/check_suite/head_sha")
+            .and_then(Value::as_str)?;
+        fetch_pr_body_by_commit(full_name, sha).await?
+    };
+    session_marker::extract_uuid(&body)
+}
 
-    let spawn = tokio::process::Command::new("gh")
-        .args([
+/// `gh api repos/OWNER/NAME/pulls/N --jq .body`. Returns the body on
+/// success, `None` on any failure (with a journal warning for each
+/// failure mode). Factored out of `uuid_from_check_suite` so both the
+/// direct-number and commit-lookup paths share the same subprocess
+/// handling (timeout + kill_on_drop).
+async fn fetch_pr_body_by_number(full_name: &str, number: u64) -> Option<String> {
+    run_gh_for_body(
+        &[
             "api",
             &format!("repos/{full_name}/pulls/{number}"),
             "--jq",
             ".body",
-        ])
+        ],
+        full_name,
+        &format!("pr={number}"),
+    )
+    .await
+}
+
+/// `gh api repos/OWNER/NAME/commits/SHA/pulls --jq '.[0].body'`. Used
+/// when the webhook payload has no PR number — post-merge default-branch
+/// events, where the PR was squashed/merged and only the new merge
+/// commit SHA is in the event. GitHub's API still associates the PR
+/// with the resulting commit, so this recovers the original PR body
+/// (and thus the claude-session marker) for author routing.
+async fn fetch_pr_body_by_commit(full_name: &str, sha: &str) -> Option<String> {
+    run_gh_for_body(
+        &[
+            "api",
+            &format!("repos/{full_name}/commits/{sha}/pulls"),
+            "--jq",
+            ".[0].body",
+        ],
+        full_name,
+        &format!("sha={sha}"),
+    )
+    .await
+}
+
+/// Spawn `gh` with the supplied args, enforce [`GH_API_TIMEOUT`] with
+/// `kill_on_drop`, and return stdout trimmed. `context` is a short
+/// identifier (e.g. `pr=536` or `sha=abc12345`) included in warnings
+/// so a journal-tail diagnoses UUID-routing regressions without
+/// having to reconstruct which call failed.
+async fn run_gh_for_body(args: &[&str], repo: &str, context: &str) -> Option<String> {
+    let spawn = tokio::process::Command::new("gh")
+        .args(args)
         .kill_on_drop(true)
         .output();
     let out = match tokio::time::timeout(GH_API_TIMEOUT, spawn).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
-            // Typically "No such file or directory" (gh not installed)
-            // or a permissions problem on the binary. Surface it — the
-            // operator needs to know why UUID routing is quietly
-            // falling back to repo-prefix every time.
             warn!(
                 error = %e,
-                pr = number,
-                repo = full_name,
+                repo,
+                context,
                 "failed to spawn `gh` for check_suite UUID resolution"
             );
             return None;
@@ -725,9 +777,7 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
         Err(_) => {
             warn!(
                 timeout_secs = GH_API_TIMEOUT.as_secs(),
-                pr = number,
-                repo = full_name,
-                "`gh api` timed out during check_suite UUID resolution; killed"
+                repo, context, "`gh api` timed out during check_suite UUID resolution; killed"
             );
             return None;
         }
@@ -736,17 +786,18 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
         warn!(
             status = %out.status,
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            pr = number,
-            repo = full_name,
-            "gh api pulls/N failed during UUID resolution"
+            repo,
+            context,
+            "`gh api` failed during UUID resolution"
         );
         return None;
     }
     let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if body.is_empty() {
-        return None;
+        None
+    } else {
+        Some(body)
     }
-    session_marker::extract_uuid(&body)
 }
 
 /// Run `session_by_uuid::resolve_tmux_session`, log both the UUID-
