@@ -719,9 +719,11 @@ enum CheckSuiteLookup {
     /// number in either `check_suite.pull_requests[]` or a
     /// `refs/pull/<N>/(head|merge)` head_branch.
     ByNumber(u64),
-    /// Fetch `/commits/SHA/pulls` and take the first PR's body. Used
-    /// when the payload has no PR number anywhere — the post-merge
-    /// default-branch shape.
+    /// Fetch `/commits/SHA/pulls` and take the first PR's body. The
+    /// general fallback for any payload that carries no PR number
+    /// but does provide a `head_sha`; the post-merge default-branch
+    /// shape is the common motivating case, but direct pushes and
+    /// other number-less check_suite shapes land here too.
     ByCommit(String),
 }
 
@@ -1007,9 +1009,10 @@ mod tests {
         );
     }
 
-    /// Same as above but covers the other default branch names we
-    /// already recognize elsewhere. None of them should yield a
-    /// spurious `ByNumber`.
+    /// Same as above but covers a mix of common non-PR branches —
+    /// the canonical defaults (main/master/trunk) plus an arbitrary
+    /// long-lived branch (`develop`) and a release branch shape.
+    /// None of them should yield a spurious `ByNumber`.
     #[test]
     fn lookup_strategy_falls_through_to_commit_for_any_non_pr_branch() {
         for branch in ["main", "master", "trunk", "develop", "release/1.0"] {
