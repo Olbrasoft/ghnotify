@@ -421,6 +421,18 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
         // single-event prompt still reaches the session.
         return CiRefinement::FailOpen;
     }
+    // Settle GitHub's eventual consistency before aggregating. On a
+    // fresh push the App that finishes first (typically GitGuardian)
+    // can fire its `check_suite completed` webhook before the other
+    // Apps' check_suites have even been inserted into the
+    // `check-suites` response — so an immediate query returns
+    // `[gitguardian=success]` alone, the aggregate shows AllSuccess,
+    // and `ci-success` fires while real CI hasn't started. A short
+    // sleep covers the worst case observed on cr/ghnotify (creation
+    // lag < 3 s) with margin, without materially delaying the wake —
+    // systemd allowed up to 10 s for the webhook response already, and
+    // the aggregate path was never the fast case anyway.
+    tokio::time::sleep(std::time::Duration::from_secs(GH_AGGREGATE_SETTLE_SECS)).await;
     let suites = match fetch_check_suites(&info.full_name, &info.head_sha).await {
         Some(s) => s,
         None => return CiRefinement::FailOpen,
@@ -505,6 +517,12 @@ struct CheckSuiteEntry {
     latest_check_runs_count: u64,
     age_s: f64,
 }
+
+/// Wait this long before querying `gh api … /check-suites`. Lets
+/// GitHub finish creating the other Apps' check_suites for the
+/// commit so the aggregate response is complete. See the long
+/// comment at the only call site in [`refine_ci_decision`].
+const GH_AGGREGATE_SETTLE_SECS: u64 = 5;
 
 /// Seconds a queued suite with zero check_runs may sit before we
 /// conclude the owning App has abandoned it. Tuned to exceed the
