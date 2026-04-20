@@ -440,8 +440,29 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
         );
         return CiRefinement::FailOpen;
     }
+    // Drop check_suites whose owning App created a suite for this
+    // commit but never acted on it (status=queued, created_at ==
+    // updated_at). Post-merge main pushes hit this when GitGuardian —
+    // or any App scoped to pull_request events — still registers a
+    // suite for the push but never transitions it. Aggregating these
+    // as InProgress would wedge the main-branch wake indefinitely.
+    //
+    // If every suite is stuck-queued, fail open rather than defer: the
+    // triggering event is a real completion that deserves a wake, even
+    // if we can't verify aggregate state against a sea of abandoned
+    // suites.
+    let active: Vec<&CheckSuiteEntry> = suites.iter().filter(|s| !s.is_stuck_queued()).collect();
+    if active.is_empty() {
+        warn!(
+            sha = info.head_sha,
+            repo = info.full_name,
+            total_suites = suites.len(),
+            "every check_suite on head SHA is stuck-queued; failing open"
+        );
+        return CiRefinement::FailOpen;
+    }
     let aggregate = event::compute_ci_aggregate(
-        suites
+        active
             .iter()
             .map(|s| (s.status.as_str(), s.conclusion.as_deref())),
     );
@@ -467,6 +488,26 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
 struct CheckSuiteEntry {
     status: String,
     conclusion: Option<String>,
+    /// RFC 3339 timestamps from the GitHub API. Used to detect check_suites
+    /// that GitHub created for the commit but the owning App never acted
+    /// on — `status=queued` with `created_at == updated_at` means "the
+    /// suite was minted and nothing has happened since". GitGuardian does
+    /// this on default-branch pushes when it's only configured to scan
+    /// PRs: the suite sits queued forever, and aggregating it as
+    /// `InProgress` would wedge every main-branch wake.
+    created_at: String,
+    updated_at: String,
+}
+
+impl CheckSuiteEntry {
+    /// `status=queued` AND `updated_at == created_at`: GitHub registered
+    /// the suite for this commit but the App never so much as marked it
+    /// in_progress. Treat as abandoned so it doesn't jam the aggregate.
+    /// Guard is intentionally tight (only queued + untouched) so a
+    /// briefly-queued-but-active suite isn't mistakenly skipped.
+    fn is_stuck_queued(&self) -> bool {
+        self.status == "queued" && self.created_at == self.updated_at
+    }
 }
 
 /// Call `gh api repos/OWNER/NAME/commits/SHA/check-suites` and return
@@ -479,7 +520,7 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
             "api",
             &format!("repos/{full_name}/commits/{head_sha}/check-suites"),
             "--jq",
-            "[.check_suites[] | {status, conclusion}]",
+            "[.check_suites[] | {status, conclusion, created_at, updated_at}]",
         ])
         .kill_on_drop(true)
         .output();
@@ -655,5 +696,86 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
         Ok(())
     } else {
         Err("signature mismatch")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        status: &str,
+        conclusion: Option<&str>,
+        created_at: &str,
+        updated_at: &str,
+    ) -> CheckSuiteEntry {
+        CheckSuiteEntry {
+            status: status.into(),
+            conclusion: conclusion.map(str::to_string),
+            created_at: created_at.into(),
+            updated_at: updated_at.into(),
+        }
+    }
+
+    /// The exact GitGuardian-on-main shape: suite created by the webhook
+    /// but the App never so much as started processing. Same instant on
+    /// both timestamps is the tell.
+    #[test]
+    fn stuck_queued_detects_queued_with_identical_created_and_updated() {
+        let s = entry(
+            "queued",
+            None,
+            "2026-04-20T19:00:00Z",
+            "2026-04-20T19:00:00Z",
+        );
+        assert!(s.is_stuck_queued());
+    }
+
+    /// A queued suite that *did* transition (e.g. it's been assigned a
+    /// worker and GitHub updated the metadata, but it hasn't yet moved
+    /// to in_progress) must NOT be filtered — the App is acting on it.
+    #[test]
+    fn stuck_queued_ignores_queued_with_movement() {
+        let s = entry(
+            "queued",
+            None,
+            "2026-04-20T19:00:00Z",
+            "2026-04-20T19:00:05Z",
+        );
+        assert!(!s.is_stuck_queued());
+    }
+
+    /// in_progress / completed / any non-queued status is active regardless
+    /// of timestamps. The filter is strictly narrower than "is this suite
+    /// interesting".
+    #[test]
+    fn stuck_queued_only_matches_queued_status() {
+        for status in [
+            "in_progress",
+            "completed",
+            "waiting",
+            "requested",
+            "pending",
+        ] {
+            let s = entry(status, None, "2026-04-20T19:00:00Z", "2026-04-20T19:00:00Z");
+            assert!(
+                !s.is_stuck_queued(),
+                "status {status:?} must not count as stuck-queued even when timestamps match",
+            );
+        }
+    }
+
+    /// Regression guard: a suite that completed near-instantly (e.g. a
+    /// neutral / skipped conclusion right as it was created) may have
+    /// equal timestamps. Must not be filtered — it's genuinely done.
+    #[test]
+    fn stuck_queued_does_not_filter_instantaneously_completed_suites() {
+        let s = entry(
+            "completed",
+            Some("skipped"),
+            "2026-04-20T19:00:00Z",
+            "2026-04-20T19:00:00Z",
+        );
+        assert!(!s.is_stuck_queued());
     }
 }
