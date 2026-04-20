@@ -174,8 +174,21 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             None => {
+                // Lumped miss reasons — any of these produce Ok(None):
+                //   * no ~/.claude/projects/*/UUID.jsonl on this host
+                //     (unknown UUID, session on another machine, or typo)
+                //   * JSONL found but no cwd in the first records
+                //     (malformed / partial transcript)
+                //   * cwd known but no live tmux session matches the
+                //     basename (session terminated, running outside tmux)
+                // Enumerated rather than a single generic message so an
+                // operator can narrow the diagnosis without instrumenting
+                // the resolver.
                 eprintln!(
-                    "no tmux session owns UUID {uuid} (session not running, or not inside tmux)"
+                    "no tmux session for UUID {uuid}. Possible causes: \
+                     UUID unknown on this host (no matching JSONL under ~/.claude/projects), \
+                     JSONL transcript has no cwd record, \
+                     or the session's cwd has no live claude-<repo>[-<tty>] tmux session."
                 );
                 std::process::exit(2);
             }

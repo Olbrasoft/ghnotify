@@ -5,16 +5,26 @@
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
 //!
 //! Session resolution order:
-//!   1. **By author UUID** — if the event payload carries a PR/issue body
-//!      containing `<!-- claude-session: UUID -->` (embedded by `gh pr
-//!      create` via the global CLAUDE.md convention), route the wake to
-//!      the session that authored the PR, regardless of the event's repo.
-//!      This is the *only* correct answer when a session runs in one
-//!      directory but opens PRs in another (e.g. imdb session → cr PR).
-//!   2. **By repo name** — fall back to the prefix match on
-//!      `claude-<repo>` when the marker is absent, the session is dead,
-//!      or lookup fails. Preserves legacy behavior for any event we
-//!      can't attribute to a specific author session.
+//!   1. **By author UUID from the payload** — `pull_request`,
+//!      `pull_request_review`, `pull_request_review_comment` and
+//!      `issue_comment` payloads carry the PR/issue body inline.
+//!      Extract `<!-- claude-session: UUID -->` (embedded by `gh pr
+//!      create` per the global CLAUDE.md convention) and route the
+//!      wake to the session that authored the PR, regardless of the
+//!      event's repo. This is the *only* correct answer when a session
+//!      runs in one directory but opens PRs in another (e.g. imdb
+//!      session → cr PR).
+//!   2. **By author UUID via `gh api`** — `check_suite` payloads only
+//!      carry PR numbers, not bodies. When a check_suite references a
+//!      PR, fetch the PR body via `gh api repos/OWNER/NAME/pulls/N`
+//!      and extract the same marker, so CI wakes also land on the
+//!      pushing session. Gated on a short timeout so a stuck `gh`
+//!      (auth prompt, network stall) can't jam the webhook handler.
+//!   3. **By repo name** — fall back to the prefix match on
+//!      `claude-<repo>` when the marker is absent, the session is
+//!      dead, or any of the lookups above fail. Preserves legacy
+//!      behavior for non-PR events (`ping`, `issues assigned`) and
+//!      for PRs created before the marker convention existed.
 //!
 //! Runs in two modes:
 //!   * persistent — binds an address and serves forever (`ghnotify serve`)
@@ -330,11 +340,23 @@ fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
     session_marker::extract_uuid(body)
 }
 
+/// Upper bound on how long we'll wait for `gh api` when fetching a PR
+/// body for a `check_suite` event. Generous enough to absorb normal
+/// GitHub tail latency (p99 of `gh api pulls/N` is typically < 1 s) yet
+/// short enough that a stuck gh call can't jam the webhook handler:
+/// GitHub considers a webhook delivery failed after 10 s and will
+/// retry, which is preferable to a handler that never returns.
+const GH_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Fetch the PR body for the first PR referenced by a check_suite event
 /// and extract the claude-session marker from it.
 ///
 /// Requires `gh` to be on PATH and authenticated. Returns `None` on any
-/// failure — the caller falls back to repo-based routing.
+/// failure (spawn error, non-zero exit, empty body, timeout, missing
+/// marker) — the caller falls back to repo-based routing. Each failure
+/// mode emits a warning so UUID-routing regressions are diagnosable
+/// from the journal; silent `None`s used to hide "gh not on PATH"
+/// behind a generic repo-routing fallback.
 async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
     let prs = payload
         .pointer("/check_suite/pull_requests")
@@ -344,16 +366,40 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
 
-    let out = tokio::process::Command::new("gh")
+    let spawn = tokio::process::Command::new("gh")
         .args([
             "api",
             &format!("repos/{full_name}/pulls/{number}"),
             "--jq",
             ".body",
         ])
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(GH_API_TIMEOUT, spawn).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            // Typically "No such file or directory" (gh not installed)
+            // or a permissions problem on the binary. Surface it — the
+            // operator needs to know why UUID routing is quietly
+            // falling back to repo-prefix every time.
+            warn!(
+                error = %e,
+                pr = number,
+                repo = full_name,
+                "failed to spawn `gh` for check_suite UUID resolution"
+            );
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = GH_API_TIMEOUT.as_secs(),
+                pr = number,
+                repo = full_name,
+                "`gh api` timed out during check_suite UUID resolution; killed"
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
         warn!(
             status = %out.status,
@@ -371,23 +417,30 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
     session_marker::extract_uuid(&body)
 }
 
-/// Run `session_by_uuid::resolve_tmux_session` and log both the UUID-
-/// found-but-session-dead case and the /proc / tmux failure case, then
-/// return the tmux session name (if any) for the caller to use.
+/// Run `session_by_uuid::resolve_tmux_session`, log both the UUID-
+/// found-but-session-dead case and the JSONL/tmux lookup failure case,
+/// and return the tmux session name (if any) for the caller to use.
 fn try_resolve_uuid(uuid: &str, event_type: &str, origin: &str) -> Option<String> {
     match session_by_uuid::resolve_tmux_session(uuid) {
         Ok(Some(name)) => Some(name),
         Ok(None) => {
-            // Author session isn't live on this host (restarted, on
-            // another machine, etc.). Fall back to repo routing rather
-            // than discard — something is better than nothing.
+            // `Ok(None)` lumps several miss reasons together: UUID has
+            // no on-disk JSONL (session unknown to this host), JSONL
+            // exists but has no cwd record, or the cwd's tmux session
+            // is not live. All of them mean "author session not here" —
+            // fall back to repo routing rather than discard.
             warn!(
                 uuid,
-                origin, event_type, "author session not live; falling back to repo routing"
+                origin,
+                event_type,
+                "author session not resolvable (jsonl/cwd/tmux miss); falling back to repo routing"
             );
             None
         }
         Err(e) => {
+            // I/O or tmux failure in the JSONL/pane lookup. Surfaced
+            // so a broken home directory or tmux regression doesn't
+            // silently revert every wake to repo routing.
             warn!(error = %e, uuid, origin, event_type, "UUID resolve failed; falling back to repo routing");
             None
         }
