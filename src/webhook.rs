@@ -701,17 +701,46 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
     let full_name = payload
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
-    let body = if let Some(number) =
-        pr_number_from_payload(payload).or_else(|| pr_number_from_head_branch(payload))
-    {
-        fetch_pr_body_by_number(full_name, number).await?
-    } else {
-        let sha = payload
-            .pointer("/check_suite/head_sha")
-            .and_then(Value::as_str)?;
-        fetch_pr_body_by_commit(full_name, sha).await?
+    let body = match check_suite_lookup_strategy(payload)? {
+        CheckSuiteLookup::ByNumber(n) => fetch_pr_body_by_number(full_name, n).await?,
+        CheckSuiteLookup::ByCommit(sha) => fetch_pr_body_by_commit(full_name, &sha).await?,
     };
     session_marker::extract_uuid(&body)
+}
+
+/// Which gh-API endpoint is usable for extracting the PR body from a
+/// check_suite payload, derived purely from the payload's shape.
+/// Splitting the decision out lets [`uuid_from_check_suite`] unit-test
+/// the three known shapes (branch-named, synthetic-ref, post-merge
+/// default-branch) without having to stub out `gh` subprocesses.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckSuiteLookup {
+    /// Fetch `/pulls/N` directly. Used when the payload carries the
+    /// number in either `check_suite.pull_requests[]` or a
+    /// `refs/pull/<N>/(head|merge)` head_branch.
+    ByNumber(u64),
+    /// Fetch `/commits/SHA/pulls` and take the first PR's body. Used
+    /// when the payload has no PR number anywhere — the post-merge
+    /// default-branch shape.
+    ByCommit(String),
+}
+
+/// Decide which endpoint to hit for a given check_suite payload.
+/// Returns `None` only when the payload has no PR number *and* no
+/// `head_sha` to look commits up by — which means it can't possibly
+/// resolve UUID routing and the caller must fall back to repo-based
+/// routing.
+fn check_suite_lookup_strategy(payload: &Value) -> Option<CheckSuiteLookup> {
+    if let Some(number) =
+        pr_number_from_payload(payload).or_else(|| pr_number_from_head_branch(payload))
+    {
+        return Some(CheckSuiteLookup::ByNumber(number));
+    }
+    let sha = payload
+        .pointer("/check_suite/head_sha")
+        .and_then(Value::as_str)?
+        .to_string();
+    Some(CheckSuiteLookup::ByCommit(sha))
 }
 
 /// `gh api repos/OWNER/NAME/pulls/N --jq .body`. Returns the body on
@@ -720,17 +749,15 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
 /// direct-number and commit-lookup paths share the same subprocess
 /// handling (timeout + kill_on_drop).
 async fn fetch_pr_body_by_number(full_name: &str, number: u64) -> Option<String> {
-    run_gh_for_body(
-        &[
-            "api",
-            &format!("repos/{full_name}/pulls/{number}"),
-            "--jq",
-            ".body",
-        ],
-        full_name,
-        &format!("pr={number}"),
-    )
-    .await
+    // Bind the formatted strings to locals rather than relying on
+    // temporary-lifetime extension across the `.await` inside
+    // `run_gh_for_body`. Today's Rust rules do keep the temporaries
+    // alive for the whole call expression, but the binding makes the
+    // control flow obvious to readers and is robust against future
+    // refactors that might move the await behind an additional layer.
+    let endpoint = format!("repos/{full_name}/pulls/{number}");
+    let context = format!("pr={number}");
+    run_gh_for_body(&["api", &endpoint, "--jq", ".body"], full_name, &context).await
 }
 
 /// `gh api repos/OWNER/NAME/commits/SHA/pulls --jq '.[0].body'`. Used
@@ -740,15 +767,12 @@ async fn fetch_pr_body_by_number(full_name: &str, number: u64) -> Option<String>
 /// with the resulting commit, so this recovers the original PR body
 /// (and thus the claude-session marker) for author routing.
 async fn fetch_pr_body_by_commit(full_name: &str, sha: &str) -> Option<String> {
+    let endpoint = format!("repos/{full_name}/commits/{sha}/pulls");
+    let context = format!("sha={sha}");
     run_gh_for_body(
-        &[
-            "api",
-            &format!("repos/{full_name}/commits/{sha}/pulls"),
-            "--jq",
-            ".[0].body",
-        ],
+        &["api", &endpoint, "--jq", ".[0].body"],
         full_name,
-        &format!("sha={sha}"),
+        &context,
     )
     .await
 }
@@ -926,6 +950,97 @@ mod tests {
     fn pr_number_from_head_branch_handles_missing_field() {
         let payload = json!({"check_suite": {}});
         assert_eq!(pr_number_from_head_branch(&payload), None);
+    }
+
+    // ---- check_suite_lookup_strategy ----
+
+    /// Branch-named PR event: `pull_requests[]` carries the number,
+    /// so `ByNumber` wins over the head_branch or SHA paths.
+    #[test]
+    fn lookup_strategy_branch_named_returns_by_number_from_pull_requests() {
+        let payload = json!({
+            "check_suite": {
+                "pull_requests": [{"number": 536}],
+                "head_branch": "feat/some-branch",
+                "head_sha": "abc12345",
+            },
+        });
+        assert_eq!(
+            check_suite_lookup_strategy(&payload),
+            Some(CheckSuiteLookup::ByNumber(536)),
+        );
+    }
+
+    /// Synthetic-ref event: `pull_requests[]` is empty, but
+    /// `head_branch=refs/pull/N/head` supplies the number. Still
+    /// resolves to `ByNumber` — no commit lookup needed.
+    #[test]
+    fn lookup_strategy_synthetic_ref_returns_by_number_from_head_branch() {
+        let payload = json!({
+            "check_suite": {
+                "pull_requests": [],
+                "head_branch": "refs/pull/42/head",
+                "head_sha": "abc12345",
+            },
+        });
+        assert_eq!(
+            check_suite_lookup_strategy(&payload),
+            Some(CheckSuiteLookup::ByNumber(42)),
+        );
+    }
+
+    /// Post-merge default-branch: no number anywhere — must fall back
+    /// to `ByCommit` using `head_sha`. Regression guard for the cr
+    /// `branch=main pr=none` misrouting.
+    #[test]
+    fn lookup_strategy_post_merge_main_returns_by_commit() {
+        let payload = json!({
+            "check_suite": {
+                "pull_requests": [],
+                "head_branch": "main",
+                "head_sha": "aa2f6019deadbeef",
+            },
+        });
+        assert_eq!(
+            check_suite_lookup_strategy(&payload),
+            Some(CheckSuiteLookup::ByCommit("aa2f6019deadbeef".into())),
+        );
+    }
+
+    /// Same as above but covers the other default branch names we
+    /// already recognize elsewhere. None of them should yield a
+    /// spurious `ByNumber`.
+    #[test]
+    fn lookup_strategy_falls_through_to_commit_for_any_non_pr_branch() {
+        for branch in ["main", "master", "trunk", "develop", "release/1.0"] {
+            let payload = json!({
+                "check_suite": {
+                    "pull_requests": [],
+                    "head_branch": branch,
+                    "head_sha": "cafe0000",
+                },
+            });
+            assert_eq!(
+                check_suite_lookup_strategy(&payload),
+                Some(CheckSuiteLookup::ByCommit("cafe0000".into())),
+                "non-PR branch {branch:?} should resolve via commit lookup",
+            );
+        }
+    }
+
+    /// A malformed payload that has neither a PR number nor a
+    /// head_sha can't route by UUID at all. Must return `None` so
+    /// the caller falls back to repo routing rather than inventing
+    /// an empty-SHA gh call.
+    #[test]
+    fn lookup_strategy_returns_none_without_pr_number_or_sha() {
+        let payload = json!({
+            "check_suite": {
+                "pull_requests": [],
+                "head_branch": "main",
+            },
+        });
+        assert_eq!(check_suite_lookup_strategy(&payload), None);
     }
 
     fn entry(
