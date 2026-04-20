@@ -26,9 +26,14 @@
 //!      runs in one directory but opens PRs in another (e.g. imdb
 //!      session → cr PR).
 //!   2. **By author UUID via `gh api`** — `check_suite` payloads only
-//!      carry PR numbers, not bodies. When a check_suite references a
-//!      PR, fetch the PR body via `gh api repos/OWNER/NAME/pulls/N`
-//!      and extract the same marker, so CI wakes also land on the
+//!      carry PR numbers, not bodies. We look for the number first in
+//!      `check_suite.pull_requests[]` (branch-named events) and then
+//!      in `check_suite.head_branch` parsed as `refs/pull/<N>/(head|
+//!      merge)` (GitHub's synthetic-ref events, where the array is
+//!      typically empty). Either way we then fetch the PR body via
+//!      `gh api repos/OWNER/NAME/pulls/N` and extract the same marker,
+//!      so CI wakes — including the aggregate wake when the
+//!      synthetic-ref suite is the last to complete — land on the
 //!      pushing session. Gated on a short timeout so a stuck `gh`
 //!      (auth prompt, network stall) can't jam the webhook handler.
 //!   3. **By repo name** — fall back to the prefix match on
@@ -633,8 +638,53 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
 /// retry, which is preferable to a handler that never returns.
 const GH_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Fetch the PR body for the first PR referenced by a check_suite event
+/// Extract the PR number from the check_suite's `pull_requests` array.
+/// Branch-named `check_suite completed` events carry this — synthetic
+/// refs often do not.
+fn pr_number_from_payload(payload: &Value) -> Option<u64> {
+    payload
+        .pointer("/check_suite/pull_requests")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|pr| pr.get("number")?.as_u64())
+}
+
+/// Parse `N` out of a `head_branch` like `refs/pull/536/head` or
+/// `refs/pull/536/merge`. Exactly-shaped to rule out user-authored
+/// branches that happen to share the prefix (`refs/pull/foo/bar`,
+/// `refs/pull/4/patch`, `refs/pulls/…`). Used as a fallback when the
+/// check_suite payload's `pull_requests` array is empty, which is the
+/// signature of GitHub's synthetic-ref dispatch.
+fn pr_number_from_head_branch(payload: &Value) -> Option<u64> {
+    let head_branch = payload
+        .pointer("/check_suite/head_branch")
+        .and_then(Value::as_str)?;
+    let rest = head_branch.strip_prefix("refs/pull/")?;
+    let (num, tail) = rest.split_once('/')?;
+    if !matches!(tail, "head" | "merge") {
+        return None;
+    }
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse().ok()
+}
+
+/// Fetch the PR body for the PR referenced by a check_suite event
 /// and extract the claude-session marker from it.
+///
+/// Looks for the PR number in two places: first the `pull_requests`
+/// array on the check_suite, which carries it for branch-named
+/// check_suite events; then the `head_branch` itself, which for
+/// GitHub's synthetic `refs/pull/<N>/(head|merge)` dispatch carries
+/// the number even when `pull_requests` is empty. Without the
+/// fallback, the wake for the synthetic-ref suite (which is often
+/// the *last* suite to complete and therefore the one `refine_ci`
+/// forwards) falls back to repo-based routing — and lands on
+/// whichever session happens to have the event's repo open, not the
+/// author session that actually opened the PR. Reproduced on cr#536:
+/// the synthetic-ref `ci-success` wake went to `claude-cr-pts-4` even
+/// though the PR was opened from `claude-imdb-pts-2`.
 ///
 /// Requires `gh` to be on PATH and authenticated. Returns `None` on any
 /// failure (spawn error, non-zero exit, empty body, timeout, missing
@@ -643,10 +693,7 @@ const GH_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// from the journal; silent `None`s used to hide "gh not on PATH"
 /// behind a generic repo-routing fallback.
 async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
-    let prs = payload
-        .pointer("/check_suite/pull_requests")
-        .and_then(Value::as_array)?;
-    let number = prs.iter().find_map(|pr| pr.get("number")?.as_u64())?;
+    let number = pr_number_from_payload(payload).or_else(|| pr_number_from_head_branch(payload))?;
     let full_name = payload
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
@@ -758,6 +805,77 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ---- pr_number_from_payload ----
+
+    #[test]
+    fn pr_number_from_payload_reads_first_number() {
+        let payload = json!({
+            "check_suite": {"pull_requests": [{"number": 536}, {"number": 999}]},
+        });
+        assert_eq!(pr_number_from_payload(&payload), Some(536));
+    }
+
+    #[test]
+    fn pr_number_from_payload_returns_none_for_empty_array() {
+        let payload = json!({"check_suite": {"pull_requests": []}});
+        assert_eq!(pr_number_from_payload(&payload), None);
+    }
+
+    #[test]
+    fn pr_number_from_payload_returns_none_for_missing_field() {
+        let payload = json!({"check_suite": {}});
+        assert_eq!(pr_number_from_payload(&payload), None);
+    }
+
+    // ---- pr_number_from_head_branch ----
+
+    /// Regression guard for cr#536: the synthetic-ref check_suite wake
+    /// for `refs/pull/536/head` must route via UUID to the author
+    /// session, not via repo fallback to whichever session has the
+    /// repo open. Parsing 536 out of `head_branch` is what enables
+    /// `uuid_from_check_suite` to fetch the PR body.
+    #[test]
+    fn pr_number_from_head_branch_parses_refs_pull_head() {
+        let payload = json!({"check_suite": {"head_branch": "refs/pull/536/head"}});
+        assert_eq!(pr_number_from_head_branch(&payload), Some(536));
+    }
+
+    #[test]
+    fn pr_number_from_head_branch_parses_refs_pull_merge() {
+        let payload = json!({"check_suite": {"head_branch": "refs/pull/42/merge"}});
+        assert_eq!(pr_number_from_head_branch(&payload), Some(42));
+    }
+
+    /// Must not over-match user-authored branches that happen to
+    /// share the `refs/pull/` prefix. Exactly-shaped parsing only.
+    #[test]
+    fn pr_number_from_head_branch_rejects_lookalikes() {
+        for head_branch in [
+            "refs/pull/foo",           // no tail segment
+            "refs/pull/foo/bar",       // non-numeric "number"
+            "refs/pull/4/patch",       // wrong tail segment
+            "refs/pull//head",         // empty number
+            "refs/pull/4/head/extra",  // trailing path component
+            "refs/pulls/4/head",       // wrong prefix spelling
+            "refs/pull-custom/4/head", // prefix doesn't match exactly
+            "feat/some-branch",        // normal branch name
+        ] {
+            let payload = json!({"check_suite": {"head_branch": head_branch}});
+            assert_eq!(
+                pr_number_from_head_branch(&payload),
+                None,
+                "head_branch {head_branch:?} must not yield a PR number",
+            );
+        }
+    }
+
+    #[test]
+    fn pr_number_from_head_branch_handles_missing_field() {
+        let payload = json!({"check_suite": {}});
+        assert_eq!(pr_number_from_head_branch(&payload), None);
+    }
 
     fn entry(
         status: &str,
