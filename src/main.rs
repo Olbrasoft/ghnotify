@@ -7,6 +7,8 @@ mod config;
 mod event;
 mod install;
 mod install_hook;
+mod session_by_uuid;
+mod session_marker;
 mod sessions;
 mod tmux;
 mod webhook;
@@ -67,6 +69,14 @@ enum Command {
 
     /// Diagnostics: tmux installed, gh-cli auth, config reachable, sessions present.
     Doctor,
+
+    /// Resolve a Claude session UUID to the tmux session hosting it.
+    /// Useful for debugging cross-repo wake routing.
+    ResolveUuid {
+        /// Session UUID (e.g. from the `<!-- claude-session: ... -->`
+        /// marker in a PR body).
+        uuid: String,
+    },
 
     /// Install the `claude()` shell wrapper into ~/.bashrc or ~/.zshrc.
     /// Idempotent: re-running updates the managed block in place.
@@ -158,6 +168,18 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => sessions::doctor(),
+        Command::ResolveUuid { uuid } => match session_by_uuid::resolve_tmux_session(&uuid)? {
+            Some(name) => {
+                println!("{name}");
+                Ok(())
+            }
+            None => {
+                eprintln!(
+                    "no tmux session owns UUID {uuid} (session not running, or not inside tmux)"
+                );
+                std::process::exit(2);
+            }
+        },
         Command::Install { shell, rc, dry_run } => {
             let shell = match shell.as_deref() {
                 Some(s) => install::Shell::from_name(s)?,

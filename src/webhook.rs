@@ -1,8 +1,20 @@
 //! HTTP webhook receiver. Accepts GitHub-style JSON webhooks at `POST /webhook`,
-//! resolves the affected repo, and dispatches a prompt to the matching tmux session.
+//! resolves the target Claude session, and dispatches a prompt via tmux.
 //!
 //! GitHub event payload shape (subset we care about):
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
+//!
+//! Session resolution order:
+//!   1. **By author UUID** — if the event payload carries a PR/issue body
+//!      containing `<!-- claude-session: UUID -->` (embedded by `gh pr
+//!      create` via the global CLAUDE.md convention), route the wake to
+//!      the session that authored the PR, regardless of the event's repo.
+//!      This is the *only* correct answer when a session runs in one
+//!      directory but opens PRs in another (e.g. imdb session → cr PR).
+//!   2. **By repo name** — fall back to the prefix match on
+//!      `claude-<repo>` when the marker is absent, the session is dead,
+//!      or lookup fails. Preserves legacy behavior for any event we
+//!      can't attribute to a specific author session.
 //!
 //! Runs in two modes:
 //!   * persistent — binds an address and serves forever (`ghnotify serve`)
@@ -10,7 +22,7 @@
 //!     intended to be run per-connection under systemd socket activation so
 //!     nothing is running between webhook deliveries.
 
-use crate::{config::Config, event, sessions, tmux};
+use crate::{config::Config, event, session_by_uuid, session_marker, sessions, tmux};
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
@@ -21,6 +33,7 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use listenfd::ListenFd;
+use serde_json::Value;
 use sha2::Sha256;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -189,29 +202,30 @@ async fn process_webhook(
         }
     };
 
-    // 4. Dispatch to the matching tmux session. Routing is prefix-aware so
-    //    tty-suffixed sessions (`claude-<repo>-<tty>`) from shells that
-    //    disambiguate per-terminal still receive webhooks.
+    // 4. Resolve target session. UUID-based first (correct across repos),
+    //    repo-prefix fallback (legacy behavior for events we can't
+    //    attribute to a specific author session).
     let base = tmux::session_name_for_repo(repo_name);
-    let session = match sessions::resolve_session_for_repo(repo_name) {
-        Ok(Some(name)) => name,
+    let (session, via) = match resolve_target_session(event_type, &payload, repo_name).await {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => {
             info!(
                 base,
-                event_type, "no claude session for repo, event discarded"
+                event_type,
+                "no claude session found (neither author UUID nor repo), event discarded"
             );
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
                     "discarded": true,
-                    "reason": "no claude session running for this repo",
+                    "reason": "no matching claude session",
                     "session": base,
                 })),
             );
         }
         Err(e) => {
-            error!(error = %e, "failed to list tmux sessions");
+            error!(error = %e, "session resolution failed");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
@@ -220,10 +234,10 @@ async fn process_webhook(
     };
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
-            info!(session, event_type, "prompt delivered");
+            info!(session, via, event_type, "prompt delivered");
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "session": session })),
+                Json(serde_json::json!({ "ok": true, "session": session, "via": via })),
             )
         }
         // Session vanished between list and send (rare race). Treat as soft
@@ -231,7 +245,7 @@ async fn process_webhook(
         Ok(tmux::Delivery::NoSession) => {
             info!(
                 session,
-                event_type, "session disappeared before send, event discarded"
+                via, event_type, "session disappeared before send, event discarded"
             );
             (
                 StatusCode::OK,
@@ -240,15 +254,142 @@ async fn process_webhook(
                     "discarded": true,
                     "reason": "session disappeared before send",
                     "session": session,
+                    "via": via,
                 })),
             )
         }
         Err(e) => {
-            error!(session, error = %e, "tmux send_prompt failed");
+            error!(session, via, error = %e, "tmux send_prompt failed");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
             )
+        }
+    }
+}
+
+/// Try author-UUID routing first, then fall back to repo-name routing.
+///
+/// Returns `Ok(Some((session, "uuid"|"repo")))` on match, `Ok(None)` when
+/// nothing matches (soft discard), `Err` only for unexpected I/O failures
+/// that should surface as 503 rather than be silently swallowed.
+async fn resolve_target_session(
+    event_type: &str,
+    payload: &Value,
+    repo_name: &str,
+) -> Result<Option<(String, &'static str)>> {
+    // A — UUID embedded directly in the webhook payload. Covers
+    // pull_request, pull_request_review, pull_request_review_comment
+    // and issue_comment (on PRs).
+    if let Some(uuid) = uuid_from_payload(event_type, payload) {
+        if let Some(name) = try_resolve_uuid(&uuid, event_type, "payload") {
+            return Ok(Some((name, "uuid")));
+        }
+    }
+
+    // B — check_suite payloads don't include the PR body, only PR numbers.
+    // Fetch the body via `gh api` so we can still do author-routing for
+    // CI wakes, which the user expects to land on whoever pushed the
+    // commit (not on "whichever session happens to have this repo open").
+    if event_type == "check_suite" {
+        if let Some(uuid) = uuid_from_check_suite(payload).await {
+            if let Some(name) = try_resolve_uuid(&uuid, event_type, "check_suite/gh") {
+                return Ok(Some((name, "uuid")));
+            }
+        }
+    }
+
+    // C — repo-prefix fallback. Preserves legacy behavior for events
+    // without a marker (ping, issues assigned, issue_comment on non-PR
+    // issues) and as a safety net when the author session is dead.
+    match sessions::resolve_session_for_repo(repo_name)? {
+        Some(name) => Ok(Some((name, "repo"))),
+        None => Ok(None),
+    }
+}
+
+/// Extract the claude-session marker from fields directly present in the
+/// webhook payload. Returns `None` for event types whose payloads don't
+/// carry a PR/issue body, or when no marker is present in the body.
+fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
+    let body = match event_type {
+        // `pull_request` events carry the PR body at /pull_request/body.
+        // `pull_request_review` and `pull_request_review_comment` also
+        // include the full `pull_request` object for context.
+        "pull_request" | "pull_request_review" | "pull_request_review_comment" => {
+            payload.pointer("/pull_request/body")
+        }
+        // issue_comment on a PR has `issue.pull_request` set and
+        // `issue.body` carries the PR body. For non-PR issues, the body
+        // is just the issue body (very rarely has a claude-session
+        // marker), but trying is harmless.
+        "issue_comment" => payload.pointer("/issue/body"),
+        _ => None,
+    }?
+    .as_str()?;
+    session_marker::extract_uuid(body)
+}
+
+/// Fetch the PR body for the first PR referenced by a check_suite event
+/// and extract the claude-session marker from it.
+///
+/// Requires `gh` to be on PATH and authenticated. Returns `None` on any
+/// failure — the caller falls back to repo-based routing.
+async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
+    let prs = payload
+        .pointer("/check_suite/pull_requests")
+        .and_then(Value::as_array)?;
+    let number = prs.iter().find_map(|pr| pr.get("number")?.as_u64())?;
+    let full_name = payload
+        .pointer("/repository/full_name")
+        .and_then(Value::as_str)?;
+
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{full_name}/pulls/{number}"),
+            "--jq",
+            ".body",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        warn!(
+            status = %out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            pr = number,
+            repo = full_name,
+            "gh api pulls/N failed during UUID resolution"
+        );
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if body.is_empty() {
+        return None;
+    }
+    session_marker::extract_uuid(&body)
+}
+
+/// Run `session_by_uuid::resolve_tmux_session` and log both the UUID-
+/// found-but-session-dead case and the /proc / tmux failure case, then
+/// return the tmux session name (if any) for the caller to use.
+fn try_resolve_uuid(uuid: &str, event_type: &str, origin: &str) -> Option<String> {
+    match session_by_uuid::resolve_tmux_session(uuid) {
+        Ok(Some(name)) => Some(name),
+        Ok(None) => {
+            // Author session isn't live on this host (restarted, on
+            // another machine, etc.). Fall back to repo routing rather
+            // than discard — something is better than nothing.
+            warn!(
+                uuid,
+                origin, event_type, "author session not live; falling back to repo routing"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, uuid, origin, event_type, "UUID resolve failed; falling back to repo routing");
+            None
         }
     }
 }
