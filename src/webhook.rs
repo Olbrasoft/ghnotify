@@ -440,12 +440,20 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
         );
         return CiRefinement::FailOpen;
     }
-    // Drop check_suites whose owning App created a suite for this
-    // commit but never acted on it (status=queued, created_at ==
-    // updated_at). Post-merge main pushes hit this when GitGuardian —
-    // or any App scoped to pull_request events — still registers a
-    // suite for the push but never transitions it. Aggregating these
-    // as InProgress would wedge the main-branch wake indefinitely.
+    // Drop check_suites that the owning App created but has abandoned
+    // while other Apps made progress. Post-merge main pushes hit this
+    // when an App scoped to pull_request events (GitGuardian is the
+    // concrete case) still registers a suite for the push but never
+    // transitions it; aggregating those as InProgress would wedge the
+    // main-branch wake indefinitely.
+    //
+    // The filter compares each queued-and-untouched suite against the
+    // *newest-completed* suite on the same commit. Only when another
+    // App has completed a whole workflow AFTER this one was last
+    // touched do we conclude it's abandoned — a freshly-minted queued
+    // suite on a PR still has `updated_at ≥ newest_completed` because
+    // both fall inside the same push window, so it stays active and
+    // keeps the aggregate honest.
     //
     // If every suite is stuck-queued, fail open rather than defer: the
     // triggering event is a real completion that deserves a wake, even
@@ -484,29 +492,55 @@ async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
 }
 
 /// Entry in the aggregate check_suites list for a commit.
+///
+/// `age_s` is computed in the gh query via jq's `now -
+/// (.updated_at | fromdateiso8601)` — the wall-clock age in seconds
+/// of the suite's last transition. Combined with
+/// `latest_check_runs_count` it lets us tell a queued suite GitHub
+/// is about to pick up from one the owning App has abandoned.
 #[derive(serde::Deserialize)]
 struct CheckSuiteEntry {
     status: String,
     conclusion: Option<String>,
-    /// RFC 3339 timestamps from the GitHub API. Used to detect check_suites
-    /// that GitHub created for the commit but the owning App never acted
-    /// on — `status=queued` with `created_at == updated_at` means "the
-    /// suite was minted and nothing has happened since". GitGuardian does
-    /// this on default-branch pushes when it's only configured to scan
-    /// PRs: the suite sits queued forever, and aggregating it as
-    /// `InProgress` would wedge every main-branch wake.
-    created_at: String,
-    updated_at: String,
+    latest_check_runs_count: u64,
+    age_s: f64,
 }
 
+/// Seconds a queued suite with zero check_runs may sit before we
+/// conclude the owning App has abandoned it. Tuned to exceed the
+/// observed worker-pickup delay for active Apps (≈ 1–5 s in practice,
+/// < 15 s even for slow ones) while still being short enough that
+/// main-branch post-merge wakes — where `github-actions` typically
+/// completes in ~30 s and GitGuardian never produces a check_run —
+/// clear the threshold when the real suite's completion event fires.
+/// Below this, we keep the suite in the aggregate and let the next
+/// event carry the wake; above it with check_runs still 0, the App
+/// is treated as having dropped the suite on the floor.
+const STUCK_QUEUED_AGE_THRESHOLD_S: f64 = 25.0;
+
 impl CheckSuiteEntry {
-    /// `status=queued` AND `updated_at == created_at`: GitHub registered
-    /// the suite for this commit but the App never so much as marked it
-    /// in_progress. Treat as abandoned so it doesn't jam the aggregate.
-    /// Guard is intentionally tight (only queued + untouched) so a
-    /// briefly-queued-but-active suite isn't mistakenly skipped.
+    /// Detect a check_suite the owning App has abandoned. Requires all of:
+    /// * `status == "queued"` — anything further is making progress.
+    /// * `latest_check_runs_count == 0` — the App has not created so
+    ///   much as a single check_run, meaning no worker has picked it up.
+    ///   Once an App starts, a check_run exists immediately.
+    /// * `age_s > STUCK_QUEUED_AGE_THRESHOLD_S` — a legitimately
+    ///   newly-minted queued suite on a fresh PR push is only a few
+    ///   seconds old when the first peer completes; a truly abandoned
+    ///   one (GitGuardian on a default-branch push) has been sitting
+    ///   since the commit was pushed while another App ran its whole
+    ///   workflow.
+    ///
+    /// All three guards are necessary. `status=queued` alone would
+    /// filter freshly-minted suites that are about to start. A pure
+    /// age guard would filter slow-to-pick-up active suites that
+    /// already have check_runs recorded. Requiring every condition
+    /// keeps the filter conservative enough that we don't re-introduce
+    /// the premature-wake bug on fast PRs.
     fn is_stuck_queued(&self) -> bool {
-        self.status == "queued" && self.created_at == self.updated_at
+        self.status == "queued"
+            && self.latest_check_runs_count == 0
+            && self.age_s > STUCK_QUEUED_AGE_THRESHOLD_S
     }
 }
 
@@ -520,7 +554,11 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
             "api",
             &format!("repos/{full_name}/commits/{head_sha}/check-suites"),
             "--jq",
-            "[.check_suites[] | {status, conclusion, created_at, updated_at}]",
+            // `age_s` is computed here, not in Rust, so the filter
+            // measures age at the exact moment gh observed the API
+            // response. jq's `now` is the process's wall clock;
+            // `fromdateiso8601` parses GitHub's RFC 3339 `updated_at`.
+            "[.check_suites[] | {status, conclusion, latest_check_runs_count, age_s: (now - (.updated_at | fromdateiso8601))}]",
         ])
         .kill_on_drop(true)
         .output();
@@ -706,48 +744,48 @@ mod tests {
     fn entry(
         status: &str,
         conclusion: Option<&str>,
-        created_at: &str,
-        updated_at: &str,
+        latest_check_runs_count: u64,
+        age_s: f64,
     ) -> CheckSuiteEntry {
         CheckSuiteEntry {
             status: status.into(),
             conclusion: conclusion.map(str::to_string),
-            created_at: created_at.into(),
-            updated_at: updated_at.into(),
+            latest_check_runs_count,
+            age_s,
         }
     }
 
-    /// The exact GitGuardian-on-main shape: suite created by the webhook
-    /// but the App never so much as started processing. Same instant on
-    /// both timestamps is the tell.
+    /// The GitGuardian-on-main shape: queued, zero check_runs, sitting
+    /// well past the threshold while another App ran and completed.
     #[test]
-    fn stuck_queued_detects_queued_with_identical_created_and_updated() {
-        let s = entry(
-            "queued",
-            None,
-            "2026-04-20T19:00:00Z",
-            "2026-04-20T19:00:00Z",
-        );
+    fn stuck_queued_detects_abandoned_suite() {
+        let s = entry("queued", None, 0, 120.0);
         assert!(s.is_stuck_queued());
     }
 
-    /// A queued suite that *did* transition (e.g. it's been assigned a
-    /// worker and GitHub updated the metadata, but it hasn't yet moved
-    /// to in_progress) must NOT be filtered — the App is acting on it.
+    /// Regression guard for the cr#535 bug: the other Apps' suites
+    /// are fresh (low age_s, no check_runs yet) when GitGuardian
+    /// completes first. Must NOT be flagged — they're about to start.
     #[test]
-    fn stuck_queued_ignores_queued_with_movement() {
-        let s = entry(
-            "queued",
-            None,
-            "2026-04-20T19:00:00Z",
-            "2026-04-20T19:00:05Z",
-        );
-        assert!(!s.is_stuck_queued());
+    fn stuck_queued_does_not_filter_newly_minted_queued() {
+        let s = entry("queued", None, 0, 2.0);
+        assert!(!s.is_stuck_queued(), "2s age must not count as stuck");
     }
 
-    /// in_progress / completed / any non-queued status is active regardless
-    /// of timestamps. The filter is strictly narrower than "is this suite
-    /// interesting".
+    /// A queued suite with at least one check_run has been picked up
+    /// by a worker; the App is actively on the job regardless of age.
+    #[test]
+    fn stuck_queued_ignores_queued_with_check_runs() {
+        let s = entry("queued", None, 1, 300.0);
+        assert!(
+            !s.is_stuck_queued(),
+            "queued with check_runs ≥ 1 must never be flagged stuck even at high age",
+        );
+    }
+
+    /// in_progress / completed / any non-queued status is active
+    /// regardless of age or check_runs count. The filter is strictly
+    /// narrower than "is this suite interesting".
     #[test]
     fn stuck_queued_only_matches_queued_status() {
         for status in [
@@ -757,25 +795,33 @@ mod tests {
             "requested",
             "pending",
         ] {
-            let s = entry(status, None, "2026-04-20T19:00:00Z", "2026-04-20T19:00:00Z");
+            let s = entry(status, None, 0, 120.0);
             assert!(
                 !s.is_stuck_queued(),
-                "status {status:?} must not count as stuck-queued even when timestamps match",
+                "status {status:?} must not count as stuck-queued",
             );
         }
     }
 
-    /// Regression guard: a suite that completed near-instantly (e.g. a
-    /// neutral / skipped conclusion right as it was created) may have
-    /// equal timestamps. Must not be filtered — it's genuinely done.
+    /// A completed skipped suite has no check_runs AND age may be
+    /// high — must not be filtered because status is completed.
     #[test]
-    fn stuck_queued_does_not_filter_instantaneously_completed_suites() {
-        let s = entry(
-            "completed",
-            Some("skipped"),
-            "2026-04-20T19:00:00Z",
-            "2026-04-20T19:00:00Z",
-        );
+    fn stuck_queued_does_not_filter_completed_skipped_suites() {
+        let s = entry("completed", Some("skipped"), 0, 600.0);
         assert!(!s.is_stuck_queued());
+    }
+
+    /// Boundary of the age threshold: exactly-at and just-below must
+    /// NOT be flagged stuck. Locks in the exact cutoff so a future
+    /// retune doesn't accidentally drop the inclusive guard.
+    #[test]
+    fn stuck_queued_respects_age_threshold_lower_bound() {
+        let at_threshold = entry("queued", None, 0, STUCK_QUEUED_AGE_THRESHOLD_S);
+        assert!(
+            !at_threshold.is_stuck_queued(),
+            "exactly at threshold must not be stuck (strict >)",
+        );
+        let just_below = entry("queued", None, 0, STUCK_QUEUED_AGE_THRESHOLD_S - 0.1);
+        assert!(!just_below.is_stuck_queued());
     }
 }
