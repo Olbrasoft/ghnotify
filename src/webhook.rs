@@ -4,6 +4,17 @@
 //! GitHub event payload shape (subset we care about):
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
 //!
+//! Per-request pipeline, in order:
+//!   1. HMAC signature verification (when `github.webhook_secret` is set).
+//!   2. Classify the event into a prompt or drop reason ([`event::classify`]).
+//!   3. For `check_suite` forwards only: query every check_suite on the
+//!      head SHA via `gh api` and defer unless all are completed; when
+//!      all are done, rebuild the prompt with the *aggregate* conclusion
+//!      so a green triggering event with a red sibling still produces a
+//!      `ci-failure` wake ([`refine_ci_decision`]).
+//!   4. Resolve the target tmux session (see below).
+//!   5. Dispatch via `tmux send-keys -l`.
+//!
 //! Session resolution order:
 //!   1. **By author UUID from the payload** — `pull_request`,
 //!      `pull_request_review`, `pull_request_review_comment` and
@@ -212,6 +223,35 @@ async fn process_webhook(
         }
     };
 
+    // 3a. For check_suite wakes, defer until every check_suite on the head
+    //     SHA is complete so a single App (typically GitGuardian, which
+    //     tends to finish seconds ahead of the real CI suite) can't fire
+    //     a premature `ci-success`. Fails open on gh errors — better a
+    //     possibly-early wake than a silently-dropped one.
+    let prompt = match event_type {
+        "check_suite" => match refine_ci_decision(&payload, repo_name).await {
+            CiRefinement::ForwardAs(p) => p,
+            CiRefinement::Defer { reason } => {
+                info!(
+                    event_type,
+                    repo = repo_name,
+                    reason,
+                    "ci wake deferred (aggregate not ready)"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "deferred": true,
+                        "reason": reason,
+                    })),
+                );
+            }
+            CiRefinement::FailOpen => prompt,
+        },
+        _ => prompt,
+    };
+
     // 4. Resolve target session. UUID-based first (correct across repos),
     //    repo-prefix fallback (legacy behavior for events we can't
     //    attribute to a specific author session).
@@ -338,6 +378,136 @@ fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
     }?
     .as_str()?;
     session_marker::extract_uuid(body)
+}
+
+/// Outcome of aggregate-refining a `check_suite` wake.
+enum CiRefinement {
+    /// Aggregate is final — forward this rebuilt prompt (with the
+    /// aggregate conclusion, which can differ from the triggering
+    /// event's conclusion when a sibling suite failed).
+    ForwardAs(String),
+    /// At least one sibling suite on the head SHA is still running —
+    /// drop this wake so the final suite's completion fires a single
+    /// canonical wake.
+    Defer { reason: &'static str },
+    /// The aggregate lookup itself failed (no `gh`, network stall,
+    /// malformed payload, empty response). Fall through to the
+    /// single-event prompt so a broken lookup can't silently swallow
+    /// every CI wake.
+    FailOpen,
+}
+
+/// Query the aggregate check_suite state for the head SHA of this
+/// webhook's check_suite event and decide whether to forward, defer,
+/// or fail open.
+///
+/// GitHub fires a separate `check_suite completed` webhook per App
+/// installed on the repo (main CI, GitGuardian, Copilot reviewer, …).
+/// Treating each as a terminal CI wake fires `ci-success` the moment
+/// the *first* App's suite finishes. This helper calls
+/// `gh api repos/OWNER/NAME/commits/SHA/check-suites`, merges every
+/// suite's `(status, conclusion)` via [`event::compute_ci_aggregate`],
+/// and rebuilds the prompt with the aggregate conclusion (via
+/// [`event::build_ci_prompt`]) so a green triggering event with a red
+/// sibling escalates to `ci-failure` rather than falsely reporting
+/// success.
+async fn refine_ci_decision(payload: &Value, repo_name: &str) -> CiRefinement {
+    let info = event::extract_ci_info(payload, repo_name);
+    if info.head_sha.is_empty() || info.full_name.is_empty() {
+        // Malformed payload — we can't even query. Fall through so the
+        // single-event prompt still reaches the session.
+        return CiRefinement::FailOpen;
+    }
+    let suites = match fetch_check_suites(&info.full_name, &info.head_sha).await {
+        Some(s) => s,
+        None => return CiRefinement::FailOpen,
+    };
+    let aggregate = event::compute_ci_aggregate(
+        suites
+            .iter()
+            .map(|s| (s.status.as_str(), s.conclusion.as_deref())),
+    );
+    match aggregate {
+        event::CiAggregate::InProgress => CiRefinement::Defer {
+            reason: "sibling check_suite on head SHA not yet completed",
+        },
+        event::CiAggregate::AllSuccess => {
+            CiRefinement::ForwardAs(event::build_ci_prompt(&info, "success"))
+        }
+        event::CiAggregate::HasFailure => {
+            // "failure" is the canonical single-word conclusion; the
+            // ci_next_action_hint branches on `!= "success"` only, so the
+            // exact token doesn't matter for the hint, but we keep it
+            // stable for operators grepping `status=` in the journal.
+            CiRefinement::ForwardAs(event::build_ci_prompt(&info, "failure"))
+        }
+    }
+}
+
+/// Entry in the aggregate check_suites list for a commit.
+#[derive(serde::Deserialize)]
+struct CheckSuiteEntry {
+    status: String,
+    conclusion: Option<String>,
+}
+
+/// Call `gh api repos/OWNER/NAME/commits/SHA/check-suites` and return
+/// the `check_suites[]` array as `CheckSuiteEntry`s. Each failure mode
+/// (spawn error, timeout, non-zero exit, unparseable JSON) emits a
+/// warning and returns `None` so the caller can fail open.
+async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<CheckSuiteEntry>> {
+    let spawn = tokio::process::Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{full_name}/commits/{head_sha}/check-suites"),
+            "--jq",
+            "[.check_suites[] | {status, conclusion}]",
+        ])
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(GH_API_TIMEOUT, spawn).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                sha = head_sha,
+                repo = full_name,
+                "failed to spawn `gh` for check_suite aggregate query"
+            );
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = GH_API_TIMEOUT.as_secs(),
+                sha = head_sha,
+                repo = full_name,
+                "`gh api` timed out during check_suite aggregate query; killed"
+            );
+            return None;
+        }
+    };
+    if !out.status.success() {
+        warn!(
+            status = %out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            sha = head_sha,
+            repo = full_name,
+            "gh api commits/SHA/check-suites failed"
+        );
+        return None;
+    }
+    match serde_json::from_slice::<Vec<CheckSuiteEntry>>(&out.stdout) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                error = %e,
+                sha = head_sha,
+                repo = full_name,
+                "parsing gh check-suites response failed"
+            );
+            None
+        }
+    }
 }
 
 /// Upper bound on how long we'll wait for `gh api` when fetching a PR
