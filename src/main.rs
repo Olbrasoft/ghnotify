@@ -7,6 +7,8 @@ mod config;
 mod event;
 mod install;
 mod install_hook;
+mod session_by_uuid;
+mod session_marker;
 mod sessions;
 mod tmux;
 mod webhook;
@@ -67,6 +69,14 @@ enum Command {
 
     /// Diagnostics: tmux installed, gh-cli auth, config reachable, sessions present.
     Doctor,
+
+    /// Resolve a Claude session UUID to the tmux session hosting it.
+    /// Useful for debugging cross-repo wake routing.
+    ResolveUuid {
+        /// Session UUID (e.g. from the `<!-- claude-session: ... -->`
+        /// marker in a PR body).
+        uuid: String,
+    },
 
     /// Install the `claude()` shell wrapper into ~/.bashrc or ~/.zshrc.
     /// Idempotent: re-running updates the managed block in place.
@@ -158,6 +168,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => sessions::doctor(),
+        Command::ResolveUuid { uuid } => match session_by_uuid::resolve_tmux_session(&uuid)? {
+            Some(name) => {
+                println!("{name}");
+                Ok(())
+            }
+            None => {
+                // Lumped miss reasons — any of these produce Ok(None):
+                //   * no ~/.claude/projects/*/UUID.jsonl on this host
+                //     (unknown UUID, session on another machine, or typo)
+                //   * JSONL found but no cwd in the first records
+                //     (malformed / partial transcript)
+                //   * cwd known but no live tmux session matches the
+                //     basename (session terminated, running outside tmux)
+                // Enumerated rather than a single generic message so an
+                // operator can narrow the diagnosis without instrumenting
+                // the resolver.
+                eprintln!(
+                    "no tmux session for UUID {uuid}. Possible causes: \
+                     UUID unknown on this host (no matching JSONL under ~/.claude/projects), \
+                     JSONL transcript has no cwd record, \
+                     or the session's cwd has no live claude-<repo>[-<tty>] tmux session."
+                );
+                std::process::exit(2);
+            }
+        },
         Command::Install { shell, rc, dry_run } => {
             let shell = match shell.as_deref() {
                 Some(s) => install::Shell::from_name(s)?,
