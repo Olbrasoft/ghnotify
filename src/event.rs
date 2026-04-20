@@ -9,6 +9,17 @@
 //! was actionable. Each wake costs ~500 tokens of context and triggers a
 //! "checking …" round-trip. This module reduces that to one wake per
 //! meaningful state transition.
+//!
+//! A single commit typically has N `check_suite` entities — one per GitHub
+//! App installed on the repo (main CI workflow, GitGuardian, Copilot
+//! reviewer, …). GitHub fires a `check_suite completed` webhook for each
+//! of them independently as they finish. Classifying every one as a
+//! terminal CI wake would wake the session the moment the *first* App's
+//! suite finishes (often GitGuardian, which is typically fastest), before
+//! the real test/build suite is anywhere near done. The webhook handler
+//! compensates by querying the aggregate check_suite state via `gh api`
+//! and deferring until every suite on the head SHA has `status=completed`
+//! — see [`compute_ci_aggregate`] and `webhook::refine_ci_decision`.
 
 use serde_json::Value;
 
@@ -18,29 +29,31 @@ pub enum Decision {
     Drop { reason: &'static str },
 }
 
-/// Exactly-shaped test for GitHub's PR-synthetic check_suite refs:
-/// `refs/pull/<digits>/head` or `refs/pull/<digits>/merge`. A plain prefix
-/// match on `refs/pull/` would over-match any user-authored branch
-/// happening to share that prefix; the stricter shape avoids that over-
-/// match and rules out the obvious lookalikes (`refs/pulls/…`,
-/// `refs/pull/4/patch`, non-numeric segment, extra trailing path). A
-/// user who deliberately names a branch exactly
-/// `refs/pull/<digits>/(head|merge)` would still be suppressed — that
-/// collision is accepted as the cost of deduplicating the paired wake
-/// for the overwhelmingly common case. The check_suite payload carries
-/// no field that would distinguish a user's branch-push from GitHub's
-/// synthetic-ref dispatch once the shape matches.
-fn is_refs_pull_synthetic(head_branch: &str) -> bool {
-    let Some(rest) = head_branch.strip_prefix("refs/pull/") else {
-        return false;
-    };
-    let Some((num, tail)) = rest.split_once('/') else {
-        return false;
-    };
-    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    matches!(tail, "head" | "merge")
+/// Fields extracted from a `check_suite completed` payload that the
+/// webhook handler needs to both (a) query the aggregate check_suite
+/// state via `gh api repos/OWNER/NAME/commits/SHA/check-suites` and
+/// (b) rebuild the outgoing prompt with the *aggregate* conclusion
+/// (which can differ from this single event's conclusion — e.g. this
+/// event reports success but a sibling suite already failed).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct CiInfo {
+    pub repo: String,
+    pub pr_str: String,
+    pub head_branch: String,
+    pub head_short: String,
+    pub head_sha: String,
+    pub full_name: String,
+}
+
+/// Result of merging every check_suite's conclusion on a single head SHA.
+/// `HasFailure` wins over `AllSuccess`: a green main suite doesn't cancel
+/// out a red GitGuardian scan — if anything on this commit is broken,
+/// the aggregate wake must say so.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CiAggregate {
+    AllSuccess,
+    HasFailure,
+    InProgress,
 }
 
 /// Trim, sanitize, and truncate a review/comment body for inclusion in the
@@ -193,10 +206,13 @@ fn next_action_hint(state: &str) -> &'static str {
 ///     merge-now (Copilot will not auto re-review the fix-push); on main
 ///     it acknowledges post-merge aggregate; on failure it is an explicit
 ///     "diagnose and fix" (NOT "diagnose and stop at pre-existing").
-///     Non-terminal actions are dropped. The parallel check_suite that
-///     GitHub dispatches on the synthetic `refs/pull/N/…` ref for every
-///     PR is dropped — the branch-named pair is strictly more informative
-///     and forwarding both means the session is woken twice per CI run.
+///     Non-terminal actions are dropped. **Both** the branch-named and
+///     the synthetic `refs/pull/N/…` check_suite for a PR are
+///     forwarded; duplicate wakes are prevented downstream by
+///     `webhook::refine_ci_decision`, which only fires once every
+///     suite on the head SHA has completed. Filtering the synthetic
+///     here would silently lose the wake when it happens to be the
+///     last suite to finish — which it commonly is.
 ///   * `pull_request_review submitted`/`edited` → `code-review-complete`
 ///     with truncated `review.body` excerpt so the session sees whether the
 ///     reviewer left substantive comments (vs. just an empty "commented"
@@ -235,75 +251,28 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
         },
 
         "check_suite" if action == "completed" => {
-            let head_branch = payload
-                .pointer("/check_suite/head_branch")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
             // GitHub dispatches a parallel check_suite on the synthetic
-            // `refs/pull/N/head` (and sometimes `refs/pull/N/merge`) ref for
-            // every PR, in addition to the one for the PR's actual branch
-            // name (e.g. `fix/foo`). Both fire for the same head_sha, so
-            // forwarding both means the session gets two ci-success/failure
-            // wakes for every PR CI run. The named-branch one is strictly
-            // more informative (carries the real branch name + pr numbers
-            // together), so drop the synthetic ref to keep 1 wake per run.
-            // Post-merge redelivery of the synthetic ref is the specific
-            // case that used to look like "a late duplicate wake arriving
-            // after merge" — it's not late, it's just the second of the
-            // pair completing.
-            //
-            // The predicate matches the exact shape
-            // `refs/pull/<digits>/(head|merge)` rather than a naive
-            // prefix check, which rules out the common lookalikes
-            // (`refs/pulls/…`, `refs/pull/4/patch`, non-numeric middle,
-            // extra trailing path). A user deliberately naming a
-            // branch exactly `refs/pull/<digits>/(head|merge)` would
-            // still be suppressed — see the docstring on
-            // `is_refs_pull_synthetic` for why that residual collision
-            // is accepted.
-            if is_refs_pull_synthetic(head_branch) {
-                return Decision::Drop {
-                    reason: "check_suite on refs/pull/ synthetic ref (pair-dup of branch-named check_suite)",
-                };
-            }
+            // `refs/pull/N/head` (and sometimes `refs/pull/N/merge`) ref
+            // for every PR, in addition to the one for the PR's actual
+            // branch name (e.g. `fix/foo`). An earlier iteration of
+            // this classifier dropped the synthetic to prevent
+            // duplicate wakes, but `webhook::refine_ci_decision` now
+            // defers every check_suite completion until every suite on
+            // the head SHA is done and forwards exactly one aggregate
+            // wake. Dropping the synthetic here would prevent its
+            // completion from ever triggering the aggregate check —
+            // and in practice the synthetic is often the LAST suite
+            // to complete, so filtering it at this layer would silently
+            // lose the wake entirely. Let both events through; the
+            // aggregate check keeps duplicates down to the rare
+            // fail-open race.
             let conclusion = payload
                 .pointer("/check_suite/conclusion")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let head_sha = payload
-                .pointer("/check_suite/head_sha")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let prs: Vec<String> = payload
-                .pointer("/check_suite/pull_requests")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|pr| {
-                            pr.get("number")
-                                .and_then(Value::as_u64)
-                                .map(|n| n.to_string())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let pr_str = if prs.is_empty() {
-                "none".into()
-            } else {
-                prs.join(",")
-            };
-            let head_short = head_sha.get(..8).unwrap_or(head_sha);
-            let is_failure = conclusion != "success";
-            let kind = if is_failure {
-                "ci-failure"
-            } else {
-                "ci-success"
-            };
-            let hint = ci_next_action_hint(is_failure, &pr_str, head_branch);
+            let info = extract_ci_info(payload, repo);
             Decision::Forward {
-                prompt: format!(
-                    "ghnotify {kind}: repo={repo} status={conclusion} pr={pr_str} branch={head_branch} head={head_short}{hint}"
-                ),
+                prompt: build_ci_prompt(&info, conclusion),
             }
         }
         "check_suite" => Decision::Drop {
@@ -476,6 +445,123 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
         _ => Decision::Drop {
             reason: "unhandled event type",
         },
+    }
+}
+
+/// Pull the fields needed to build a CI wake prompt out of a check_suite
+/// payload. Missing fields degrade gracefully to empty strings — the
+/// aggregate query in the webhook handler inspects `head_sha` /
+/// `full_name` and skips the `gh api` call (fail-open to the
+/// single-event prompt) when either is empty, so a malformed or stubbed
+/// payload can't both strip the aggregate and silently vanish the wake.
+pub fn extract_ci_info(payload: &Value, repo: &str) -> CiInfo {
+    let head_sha = payload
+        .pointer("/check_suite/head_sha")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let full_name = payload
+        .pointer("/repository/full_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let head_branch = payload
+        .pointer("/check_suite/head_branch")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let prs: Vec<String> = payload
+        .pointer("/check_suite/pull_requests")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|pr| {
+                    pr.get("number")
+                        .and_then(Value::as_u64)
+                        .map(|n| n.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pr_str = if prs.is_empty() {
+        "none".into()
+    } else {
+        prs.join(",")
+    };
+    let head_short = head_sha.get(..8).unwrap_or(&head_sha).to_string();
+    CiInfo {
+        repo: repo.to_string(),
+        pr_str,
+        head_branch,
+        head_short,
+        head_sha,
+        full_name,
+    }
+}
+
+/// Build the user-facing CI wake prompt. `conclusion` is the conclusion
+/// the wake should report — normally the *aggregate* across every
+/// check_suite on the head SHA, not any single event's conclusion, so
+/// that a sibling suite's failure is visible even if the triggering
+/// event itself was a success.
+pub fn build_ci_prompt(info: &CiInfo, conclusion: &str) -> String {
+    let is_failure = conclusion != "success";
+    let kind = if is_failure {
+        "ci-failure"
+    } else {
+        "ci-success"
+    };
+    let hint = ci_next_action_hint(is_failure, &info.pr_str, &info.head_branch);
+    format!(
+        "ghnotify {kind}: repo={repo} status={conclusion} pr={pr_str} branch={branch} head={head}{hint}",
+        repo = info.repo,
+        pr_str = info.pr_str,
+        branch = info.head_branch,
+        head = info.head_short,
+    )
+}
+
+/// Merge per-suite `(status, conclusion)` pairs into a single aggregate
+/// outcome for a commit.
+///
+/// Rules:
+///   * Any suite not yet `completed` (queued/in_progress/waiting/…) →
+///     `InProgress`: the aggregate is not final yet, defer the wake.
+///   * Among completed suites, `success`/`neutral`/`skipped`/`stale` are
+///     treated as non-failures (their presence alone won't turn an
+///     otherwise-clean aggregate red — `stale` in particular is GitHub's
+///     "a newer commit superseded this result", which is neither a pass
+///     nor a failure of the current run and is safe to ignore).
+///   * Any other conclusion (`failure`, `cancelled`, `timed_out`,
+///     `action_required`, `startup_failure`, `None`, unknown) → `HasFailure`.
+///     `None` on a completed suite is unusual but we prefer to escalate
+///     than silently treat it as success.
+///   * Empty input → `InProgress`: the gh call returned no suites, which
+///     means we can't confirm readiness; the caller should fail-open to
+///     the single-event prompt rather than drop on this ambiguity.
+pub fn compute_ci_aggregate<'a, I>(suites: I) -> CiAggregate
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
+{
+    let mut any_failure = false;
+    let mut any = false;
+    for (status, conclusion) in suites {
+        any = true;
+        if status != "completed" {
+            return CiAggregate::InProgress;
+        }
+        match conclusion {
+            Some("success") | Some("neutral") | Some("skipped") | Some("stale") => {}
+            _ => any_failure = true,
+        }
+    }
+    if !any {
+        return CiAggregate::InProgress;
+    }
+    if any_failure {
+        CiAggregate::HasFailure
+    } else {
+        CiAggregate::AllSuccess
     }
 }
 
@@ -1091,11 +1177,16 @@ mod tests {
     }
 
     #[test]
-    fn check_suite_on_refs_pull_synthetic_ref_is_dropped() {
-        // GitHub dispatches a parallel check_suite for every PR on the
-        // synthetic `refs/pull/N/head` ref, in addition to the one on the
-        // PR's branch name. Forwarding both wakes the session twice for
-        // the same CI run. Drop the synthetic-ref one.
+    fn check_suite_on_refs_pull_synthetic_ref_is_still_forwarded() {
+        // An earlier version of the classifier dropped check_suite events
+        // on `refs/pull/<N>/head|merge` synthetic refs to prevent duplicate
+        // wakes. `webhook::refine_ci_decision` now defers until every
+        // suite on the head SHA is complete and forwards exactly one
+        // aggregate wake — and the synthetic is often the LAST suite to
+        // finish, so dropping it here would silently lose the entire
+        // CI run's wake. Regression guard: synthetic refs must reach
+        // classify's Forward path so their completion can trigger the
+        // aggregate check.
         for head_branch in ["refs/pull/4/head", "refs/pull/123/merge"] {
             let payload = json!({
                 "action": "completed",
@@ -1106,53 +1197,16 @@ mod tests {
                     "pull_requests": [],
                 },
             });
-            assert!(
-                matches!(
-                    classify("check_suite", &payload, "ghnotify", &[]),
-                    Decision::Drop { .. }
-                ),
-                "refs/pull/ head_branch {head_branch} should be dropped",
-            );
-        }
-    }
-
-    #[test]
-    fn check_suite_refs_pull_lookalikes_are_not_dropped_by_synthetic_filter() {
-        // The filter must match the exact shape `refs/pull/<digits>/(head|merge)`
-        // — a plain `starts_with("refs/pull/")` would over-match any
-        // user-authored branch sharing the prefix. Legitimate (if unusual)
-        // branch names below must still reach the forward path.
-        for head_branch in [
-            "refs/pull/foo",           // no trailing /head or /merge
-            "refs/pull/foo/bar",       // non-numeric "number"
-            "refs/pull/4/patch",       // wrong tail segment
-            "refs/pull//head",         // empty number
-            "refs/pull/4/head/extra",  // trailing path component
-            "refs/pulls/4/head",       // wrong prefix spelling
-            "refs/pull-custom/4/head", // prefix not matching exactly
-        ] {
-            let payload = json!({
-                "action": "completed",
-                "check_suite": {
-                    "conclusion": "success",
-                    "head_sha": "abc12345",
-                    "head_branch": head_branch,
-                    "pull_requests": [],
-                },
-            });
             let d = classify("check_suite", &payload, "ghnotify", &[]);
             assert!(
                 matches!(d, Decision::Forward { .. }),
-                "lookalike {head_branch:?} should NOT be filtered as synthetic",
+                "synthetic ref {head_branch:?} must Forward (aggregate decides duplicates)",
             );
         }
     }
 
     #[test]
-    fn check_suite_on_named_branch_is_still_forwarded() {
-        // Guard against over-filtering: a genuine feature-branch
-        // check_suite must continue to wake the session. Only the
-        // refs/pull/… synthetic-ref variant is suppressed.
+    fn check_suite_on_named_branch_is_forwarded() {
         let payload = json!({
             "action": "completed",
             "check_suite": {
@@ -1379,5 +1433,208 @@ mod tests {
             classify("issue_comment", &payload, "x", &[]),
             Decision::Forward { .. }
         ));
+    }
+
+    // ---- compute_ci_aggregate ----
+
+    /// A single completed + success suite → all-success. The smallest
+    /// shape that must resolve cleanly; repos with only one App installed
+    /// (no GitGuardian, no Copilot) should not see any behavior change.
+    #[test]
+    fn aggregate_single_completed_success() {
+        let suites = [("completed", Some("success"))];
+        assert_eq!(
+            compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+            CiAggregate::AllSuccess,
+        );
+    }
+
+    /// The exact shape of the bug: GitGuardian finishes first, main CI is
+    /// still running. Aggregate must be InProgress so the wake defers.
+    #[test]
+    fn aggregate_one_done_others_running_is_in_progress() {
+        let suites = [
+            ("completed", Some("success")), // gitguardian
+            ("in_progress", None),          // github-actions main CI
+        ];
+        assert_eq!(
+            compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+            CiAggregate::InProgress,
+        );
+    }
+
+    /// Any non-`completed` status — queued, in_progress, waiting,
+    /// requested, pending — must defer. Exhaust the non-terminal set so
+    /// a newly introduced GitHub status value can't silently pass as
+    /// "done" and resurrect the premature-wake bug.
+    #[test]
+    fn aggregate_any_non_completed_status_is_in_progress() {
+        for non_terminal in ["queued", "in_progress", "waiting", "requested", "pending"] {
+            let suites = [
+                ("completed", Some("success")),
+                (non_terminal, None),
+                ("completed", Some("success")),
+            ];
+            assert_eq!(
+                compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+                CiAggregate::InProgress,
+                "non-terminal status {non_terminal:?} must defer",
+            );
+        }
+    }
+
+    /// All completed, one failed → aggregate is failure. Failure wins
+    /// even when the triggering event was one of the successful suites.
+    #[test]
+    fn aggregate_one_failure_wins_over_many_successes() {
+        let suites = [
+            ("completed", Some("success")),
+            ("completed", Some("failure")),
+            ("completed", Some("success")),
+        ];
+        assert_eq!(
+            compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+            CiAggregate::HasFailure,
+        );
+    }
+
+    /// Every non-pass conclusion surfaces as HasFailure — especially
+    /// `None` on a completed suite (unusual, but treat as suspicious
+    /// rather than silently-passing).
+    #[test]
+    fn aggregate_non_success_conclusions_are_failures() {
+        for bad in [
+            Some("failure"),
+            Some("cancelled"),
+            Some("timed_out"),
+            Some("action_required"),
+            Some("startup_failure"),
+            None,
+            Some("some_future_conclusion"),
+        ] {
+            let suites = [("completed", Some("success")), ("completed", bad)];
+            assert_eq!(
+                compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+                CiAggregate::HasFailure,
+                "conclusion {bad:?} must count as failure",
+            );
+        }
+    }
+
+    /// `neutral` / `skipped` / `stale` are not failures. `stale` in
+    /// particular is GitHub's marker for "a newer commit superseded this
+    /// run" — treating it as a failure would turn every rebase into a
+    /// false ci-failure wake.
+    #[test]
+    fn aggregate_neutral_skipped_stale_are_not_failures() {
+        for ok in [Some("neutral"), Some("skipped"), Some("stale")] {
+            let suites = [("completed", Some("success")), ("completed", ok)];
+            assert_eq!(
+                compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+                CiAggregate::AllSuccess,
+                "conclusion {ok:?} must not count as failure",
+            );
+        }
+    }
+
+    /// Empty input (gh returned no suites, perhaps because the commit
+    /// isn't known yet) must be InProgress so the webhook handler
+    /// fails open to the single-event prompt rather than suppressing
+    /// the wake entirely on an ambiguous response.
+    #[test]
+    fn aggregate_empty_input_is_in_progress() {
+        let suites: [(&str, Option<&str>); 0] = [];
+        assert_eq!(
+            compute_ci_aggregate(suites.iter().map(|(s, c)| (*s, *c))),
+            CiAggregate::InProgress,
+        );
+    }
+
+    // ---- extract_ci_info / build_ci_prompt ----
+
+    /// The full happy-path payload shape we see from GitHub. Exercises
+    /// every field extraction and verifies build_ci_prompt wires them
+    /// into the expected prompt format.
+    #[test]
+    fn extract_ci_info_full_payload_round_trips_through_build_ci_prompt() {
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_sha": "abc123456789deadbeef",
+                "head_branch": "feat/foo",
+                "pull_requests": [{"number": 531}, {"number": 532}],
+            },
+            "repository": {"full_name": "Olbrasoft/cr"},
+        });
+        let info = extract_ci_info(&payload, "cr");
+        assert_eq!(info.repo, "cr");
+        assert_eq!(info.full_name, "Olbrasoft/cr");
+        assert_eq!(info.head_sha, "abc123456789deadbeef");
+        assert_eq!(info.head_short, "abc12345");
+        assert_eq!(info.head_branch, "feat/foo");
+        assert_eq!(info.pr_str, "531,532");
+        let prompt = build_ci_prompt(&info, "success");
+        assert!(
+            prompt.starts_with(
+                "ghnotify ci-success: repo=cr status=success pr=531,532 branch=feat/foo head=abc12345"
+            ),
+            "prefix wrong: {prompt}"
+        );
+    }
+
+    /// Aggregate-driven override: the firing event reports `success`
+    /// (this check_suite passed), but a sibling suite on the same commit
+    /// failed, so the aggregate is `HasFailure`. build_ci_prompt must
+    /// honor the caller-supplied conclusion — not re-derive it from the
+    /// payload — and emit `ci-failure` with the failure hint.
+    #[test]
+    fn build_ci_prompt_with_aggregate_failure_overrides_single_event_success() {
+        let info = CiInfo {
+            repo: "cr".into(),
+            pr_str: "7".into(),
+            head_branch: "feat/x".into(),
+            head_short: "deadbeef".into(),
+            head_sha: "deadbeef".into(),
+            full_name: "Olbrasoft/cr".into(),
+        };
+        let prompt = build_ci_prompt(&info, "failure");
+        assert!(
+            prompt.starts_with("ghnotify ci-failure:"),
+            "must escalate to failure: {prompt}"
+        );
+        assert!(
+            prompt.contains("call to action"),
+            "must include failure hint: {prompt}"
+        );
+        assert!(
+            !prompt.contains("merge NOW"),
+            "failure override must not suggest merge: {prompt}"
+        );
+    }
+
+    /// Missing `/repository/full_name` and empty `head_sha` must not
+    /// crash — extract_ci_info returns a lenient CiInfo with empty
+    /// strings in those slots, and the webhook handler's aggregate
+    /// query treats either-empty as "can't check" → fail-open to the
+    /// single-event prompt. Locks in the behavior the existing
+    /// stub-payload tests rely on.
+    #[test]
+    fn extract_ci_info_missing_optional_fields_degrades_gracefully() {
+        let payload = json!({
+            "action": "completed",
+            "check_suite": {
+                "conclusion": "success",
+                "head_branch": "feat/x",
+                "pull_requests": [],
+            },
+        });
+        let info = extract_ci_info(&payload, "cr");
+        assert_eq!(info.head_sha, "");
+        assert_eq!(info.full_name, "");
+        assert_eq!(info.pr_str, "none");
+        // Prompt still builds — malformed payload doesn't crash the pipeline.
+        let prompt = build_ci_prompt(&info, "success");
+        assert!(prompt.starts_with("ghnotify ci-success:"), "{prompt}");
     }
 }
