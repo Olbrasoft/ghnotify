@@ -126,12 +126,20 @@ fn pid_for_session_uuid(uuid: &str) -> Result<Option<u32>> {
 /// Pure parser for one `~/.claude/sessions/<pid>.json` blob. Returns
 /// the recorded pid iff `sessionId` matches `uuid`. Split out so the
 /// matching rule is unit-testable without filesystem fixtures.
+///
+/// The pid is read as `u64` from JSON and narrowed via `u32::try_from`
+/// rather than `as`: a malformed or hostile file with a value above
+/// `u32::MAX` would otherwise truncate to a small valid pid and could
+/// misroute a wake to an unrelated process. Out-of-range values yield
+/// `None` so the caller falls through to the cwd fallback.
 fn pid_from_session_json(text: &str, uuid: &str) -> Option<u32> {
     let v: Value = serde_json::from_str(text).ok()?;
     if v.get("sessionId").and_then(Value::as_str) != Some(uuid) {
         return None;
     }
-    v.get("pid").and_then(Value::as_u64).map(|p| p as u32)
+    v.get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
 }
 
 /// True when `/proc/<pid>/comm` reads exactly `claude`. Used to reject
@@ -155,13 +163,22 @@ struct PaneInfo {
 }
 
 /// Enumerate every `claude-*` pane in the tmux server. Returns an
-/// empty vec when tmux isn't running (so the resolver falls through to
-/// the cwd fallback rather than failing the webhook).
+/// empty vec in either soft-fail case — tmux binary not on PATH, or
+/// tmux server not running — so the resolver falls through to the
+/// cwd fallback rather than failing the webhook. Real failures (e.g.
+/// a regression in the `-F` format string on older tmux) still
+/// propagate as `Err`.
 fn list_claude_panes() -> Result<Vec<PaneInfo>> {
-    let out = Command::new("tmux")
+    let out = match Command::new("tmux")
         .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"])
         .output()
-        .context("failed to spawn tmux list-panes")?;
+    {
+        Ok(o) => o,
+        // tmux binary not installed → behave the same as no server
+        // running. The webhook still works; tier 2 takes over.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("failed to spawn tmux list-panes"),
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("no server running") {
@@ -424,6 +441,19 @@ mod tests {
             None,
             "missing pid field must yield None, not 0"
         );
+    }
+
+    #[test]
+    fn pid_from_session_json_rejects_pid_above_u32_max() {
+        // A malformed/hostile file with a giant pid must not silently
+        // truncate down into the valid pid space — that could route a
+        // wake to an unrelated live process. Return None instead so
+        // the caller falls through to the cwd fallback.
+        let raw = format!(
+            r#"{{"pid":{huge},"sessionId":"x"}}"#,
+            huge = u64::from(u32::MAX) + 1
+        );
+        assert_eq!(pid_from_session_json(&raw, "x"), None);
     }
 
     // -- pane parser ------------------------------------------------------
