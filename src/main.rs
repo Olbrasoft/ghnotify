@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod event;
+mod gh_lookup;
 mod install;
 mod install_hook;
 mod session_by_uuid;
@@ -52,16 +53,42 @@ enum Command {
         one_shot: bool,
     },
 
-    /// Send a one-shot prompt to a Claude tmux session by repo name.
-    /// Useful for testing and manual triggers.
+    /// Send a one-shot prompt to a Claude tmux session.
+    ///
+    /// Routing strategy, in order:
+    ///   1. If `--commit` is given, look up the PR for that SHA via
+    ///      `gh api`, extract the `<!-- claude-session: UUID -->`
+    ///      marker from the PR body, and route to the session that
+    ///      authored the PR (resolved via the pid index — works
+    ///      regardless of how the user's bashrc names sessions).
+    ///   2. Fall back to repo-name routing: `claude-<repo>` prefix
+    ///      match. Used for testing and any wake invocation that has
+    ///      no PR-author context.
+    ///
+    /// Deploy workflows that fire after a merge should pass
+    /// `--commit "$GITHUB_SHA"` (or the merge commit SHA) so the
+    /// wake lands on the PR author session, not on whichever
+    /// `claude-<repo>-*` session happens to be open. Without it, a
+    /// machine whose tmux sessions are named `claude-<user>-<tty>`
+    /// (instead of `claude-<repo>-<tty>`) silently drops every
+    /// deploy wake.
     Send {
-        /// Repo name (without owner). E.g. "GitHub.Issues" → tmux session "claude-GitHub-Issues".
+        /// Repo, e.g. `Olbrasoft/VirtualAssistant` or just
+        /// `VirtualAssistant`. The owner is stripped for the
+        /// repo-name fallback; the full `OWNER/NAME` form is
+        /// required for `--commit` lookups.
         #[arg(long)]
         repo: String,
 
         /// Prompt text to type into the session. A newline (Enter) is appended.
         #[arg(long)]
         prompt: String,
+
+        /// Commit SHA. When set, routes via the PR-author UUID
+        /// extracted from the PR body, falling back to repo-name
+        /// routing if no PR / no marker / lookup fails.
+        #[arg(long)]
+        commit: Option<String>,
     },
 
     /// List discovered Claude tmux sessions on this machine.
@@ -127,6 +154,76 @@ enum Command {
     },
 }
 
+/// Routing core for `ghnotify send`. Tries PR-author UUID first when
+/// `--commit` is supplied, falls back to repo-name routing on miss.
+async fn send_command(repo: String, prompt: String, commit: Option<String>) -> Result<()> {
+    let session = if let Some(sha) = commit.as_deref() {
+        match resolve_session_via_commit(&repo, sha).await {
+            Some(s) => s,
+            None => {
+                // Lookup miss is non-fatal: any of "PR not yet
+                // created", "no marker in body", "session not on this
+                // host", "tmux not running" lands here. Repo routing
+                // is the historical behavior, so degrading to it keeps
+                // wakes flowing for repos whose tmux sessions are
+                // named `claude-<repo>-*` even when the marker path
+                // can't resolve.
+                eprintln!(
+                    "note: --commit lookup did not yield a UUID; falling back to repo-name routing"
+                );
+                resolve_session_via_repo_or_exit(&repo)
+            }
+        }
+    } else {
+        resolve_session_via_repo_or_exit(&repo)
+    };
+
+    match tmux::send_prompt(&session, &prompt)? {
+        tmux::Delivery::Delivered => {
+            println!("delivered prompt to tmux session: {session}");
+            Ok(())
+        }
+        tmux::Delivery::NoSession => {
+            eprintln!("tmux session '{session}' disappeared before send. Use `ghnotify list` to see available sessions.");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `gh api commits/SHA/pulls` → extract marker → resolve via pid
+/// index. Returns `None` for any miss along the chain so the caller
+/// can fall back to repo routing.
+async fn resolve_session_via_commit(repo: &str, sha: &str) -> Option<String> {
+    // The commits/SHA/pulls endpoint requires the full OWNER/NAME
+    // form. Reject a bare repo name immediately rather than letting
+    // gh return a 404.
+    if !repo.contains('/') {
+        eprintln!("note: --commit requires --repo OWNER/NAME (got '{repo}'); skipping UUID lookup");
+        return None;
+    }
+    let body = gh_lookup::fetch_pr_body_by_commit(repo, sha).await?;
+    let uuid = session_marker::extract_uuid(&body)?;
+    session_by_uuid::resolve_tmux_session(&uuid).ok().flatten()
+}
+
+/// Repo-name routing: prefix-match `claude-<repo>` against live tmux
+/// sessions. Exits the process on miss — same behavior as the
+/// pre-`--commit` `Send` implementation.
+fn resolve_session_via_repo_or_exit(repo: &str) -> String {
+    let base = tmux::session_name_for_repo(repo);
+    match sessions::resolve_session_for_repo(repo) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("failed to enumerate tmux sessions: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -141,26 +238,11 @@ async fn main() -> Result<()> {
             let cfg = config::load(cli.config.as_deref())?;
             webhook::serve(cfg, bind, one_shot).await
         }
-        Command::Send { repo, prompt } => {
-            let base = tmux::session_name_for_repo(&repo);
-            let session = match sessions::resolve_session_for_repo(&repo)? {
-                Some(s) => s,
-                None => {
-                    eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
-                    std::process::exit(2);
-                }
-            };
-            match tmux::send_prompt(&session, &prompt)? {
-                tmux::Delivery::Delivered => {
-                    println!("delivered prompt to tmux session: {session}");
-                    Ok(())
-                }
-                tmux::Delivery::NoSession => {
-                    eprintln!("tmux session '{session}' disappeared before send. Use `ghnotify list` to see available sessions.");
-                    std::process::exit(2);
-                }
-            }
-        }
+        Command::Send {
+            repo,
+            prompt,
+            commit,
+        } => send_command(repo, prompt, commit).await,
         Command::List => {
             for s in sessions::list_claude_sessions()? {
                 println!("{s}");
