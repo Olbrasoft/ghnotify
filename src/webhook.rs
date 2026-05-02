@@ -48,7 +48,7 @@
 //!     intended to be run per-connection under systemd socket activation so
 //!     nothing is running between webhook deliveries.
 
-use crate::{config::Config, event, session_by_uuid, session_marker, sessions, tmux};
+use crate::{config::Config, event, gh_lookup, session_by_uuid, session_marker, sessions, tmux};
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
@@ -585,7 +585,7 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
         ])
         .kill_on_drop(true)
         .output();
-    let out = match tokio::time::timeout(GH_API_TIMEOUT, spawn).await {
+    let out = match tokio::time::timeout(gh_lookup::GH_API_TIMEOUT, spawn).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             warn!(
@@ -598,7 +598,7 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
         }
         Err(_) => {
             warn!(
-                timeout_secs = GH_API_TIMEOUT.as_secs(),
+                timeout_secs = gh_lookup::GH_API_TIMEOUT.as_secs(),
                 sha = head_sha,
                 repo = full_name,
                 "`gh api` timed out during check_suite aggregate query; killed"
@@ -629,14 +629,6 @@ async fn fetch_check_suites(full_name: &str, head_sha: &str) -> Option<Vec<Check
         }
     }
 }
-
-/// Upper bound on how long we'll wait for `gh api` when fetching a PR
-/// body for a `check_suite` event. Generous enough to absorb normal
-/// GitHub tail latency (p99 of `gh api pulls/N` is typically < 1 s) yet
-/// short enough that a stuck gh call can't jam the webhook handler:
-/// GitHub considers a webhook delivery failed after 10 s and will
-/// retry, which is preferable to a handler that never returns.
-const GH_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Extract the PR number from the check_suite's `pull_requests` array.
 /// Branch-named `check_suite completed` events carry this — synthetic
@@ -702,8 +694,10 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
     let body = match check_suite_lookup_strategy(payload)? {
-        CheckSuiteLookup::ByNumber(n) => fetch_pr_body_by_number(full_name, n).await?,
-        CheckSuiteLookup::ByCommit(sha) => fetch_pr_body_by_commit(full_name, &sha).await?,
+        CheckSuiteLookup::ByNumber(n) => gh_lookup::fetch_pr_body_by_number(full_name, n).await?,
+        CheckSuiteLookup::ByCommit(sha) => {
+            gh_lookup::fetch_pr_body_by_commit(full_name, &sha).await?
+        }
     };
     session_marker::extract_uuid(&body)
 }
@@ -743,87 +737,6 @@ fn check_suite_lookup_strategy(payload: &Value) -> Option<CheckSuiteLookup> {
         .and_then(Value::as_str)?
         .to_string();
     Some(CheckSuiteLookup::ByCommit(sha))
-}
-
-/// `gh api repos/OWNER/NAME/pulls/N --jq .body`. Returns the body on
-/// success, `None` on any failure (with a journal warning for each
-/// failure mode). Factored out of `uuid_from_check_suite` so both the
-/// direct-number and commit-lookup paths share the same subprocess
-/// handling (timeout + kill_on_drop).
-async fn fetch_pr_body_by_number(full_name: &str, number: u64) -> Option<String> {
-    // Bind the formatted strings to locals rather than relying on
-    // temporary-lifetime extension across the `.await` inside
-    // `run_gh_for_body`. Today's Rust rules do keep the temporaries
-    // alive for the whole call expression, but the binding makes the
-    // control flow obvious to readers and is robust against future
-    // refactors that might move the await behind an additional layer.
-    let endpoint = format!("repos/{full_name}/pulls/{number}");
-    let context = format!("pr={number}");
-    run_gh_for_body(&["api", &endpoint, "--jq", ".body"], full_name, &context).await
-}
-
-/// `gh api repos/OWNER/NAME/commits/SHA/pulls --jq '.[0].body'`. Used
-/// when the webhook payload has no PR number — post-merge default-branch
-/// events, where the PR was squashed/merged and only the new merge
-/// commit SHA is in the event. GitHub's API still associates the PR
-/// with the resulting commit, so this recovers the original PR body
-/// (and thus the claude-session marker) for author routing.
-async fn fetch_pr_body_by_commit(full_name: &str, sha: &str) -> Option<String> {
-    let endpoint = format!("repos/{full_name}/commits/{sha}/pulls");
-    let context = format!("sha={sha}");
-    run_gh_for_body(
-        &["api", &endpoint, "--jq", ".[0].body"],
-        full_name,
-        &context,
-    )
-    .await
-}
-
-/// Spawn `gh` with the supplied args, enforce [`GH_API_TIMEOUT`] with
-/// `kill_on_drop`, and return stdout trimmed. `context` is a short
-/// identifier (e.g. `pr=536` or `sha=abc12345`) included in warnings
-/// so a journal-tail diagnoses UUID-routing regressions without
-/// having to reconstruct which call failed.
-async fn run_gh_for_body(args: &[&str], repo: &str, context: &str) -> Option<String> {
-    let spawn = tokio::process::Command::new("gh")
-        .args(args)
-        .kill_on_drop(true)
-        .output();
-    let out = match tokio::time::timeout(GH_API_TIMEOUT, spawn).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            warn!(
-                error = %e,
-                repo,
-                context,
-                "failed to spawn `gh` for check_suite UUID resolution"
-            );
-            return None;
-        }
-        Err(_) => {
-            warn!(
-                timeout_secs = GH_API_TIMEOUT.as_secs(),
-                repo, context, "`gh api` timed out during check_suite UUID resolution; killed"
-            );
-            return None;
-        }
-    };
-    if !out.status.success() {
-        warn!(
-            status = %out.status,
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            repo,
-            context,
-            "`gh api` failed during UUID resolution"
-        );
-        return None;
-    }
-    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body)
-    }
 }
 
 /// Run `session_by_uuid::resolve_tmux_session`, log both the UUID-

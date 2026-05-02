@@ -54,6 +54,22 @@ pub fn resolve_tmux_session(uuid: &str) -> Result<Option<String>> {
     resolve_via_cwd_basename(uuid)
 }
 
+/// Strict variant: tier-1 (pid index) only, never falls back to the
+/// cwd-basename heuristic. Returns `Ok(None)` whenever the pid index
+/// can't deliver a definitive answer — no `<pid>.json` for this UUID,
+/// stale pid, or no live tmux pane in the ancestor chain.
+///
+/// Use this when the caller has hard knowledge of which session
+/// should receive the wake (e.g. `ghnotify send --commit <SHA>`
+/// where the marker UUID came from the PR body of *this specific
+/// commit's* PR). In that context, a tier-2 fallback would route to
+/// "any session in the same cwd" which may be a completely
+/// unrelated session — silently misrouting instead of cleanly
+/// missing.
+pub fn resolve_tmux_session_strict(uuid: &str) -> Result<Option<String>> {
+    resolve_via_pid_index(uuid)
+}
+
 /// Tier 1 — find the tmux session whose `pane_pid` is an ancestor of
 /// the Claude pid that owns this UUID. Returns `Ok(None)` whenever any
 /// step misses (no `<pid>.json`, recycled pid, no live tmux pane in

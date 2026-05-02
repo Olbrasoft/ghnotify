@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod event;
+mod gh_lookup;
 mod install;
 mod install_hook;
 mod session_by_uuid;
@@ -52,16 +53,43 @@ enum Command {
         one_shot: bool,
     },
 
-    /// Send a one-shot prompt to a Claude tmux session by repo name.
-    /// Useful for testing and manual triggers.
+    /// Send a one-shot prompt to a Claude tmux session.
+    ///
+    /// Routing strategy, in order:
+    ///   1. If `--commit` is given (requires `--repo OWNER/NAME`):
+    ///      look up the PR for that SHA via `gh api`, extract the
+    ///      `<!-- claude-session: UUID -->` marker, and route via
+    ///      the strict pid-index resolver. On a clean miss (no PR,
+    ///      no marker, session not on this host) falls back to
+    ///      repo-name routing. Operational resolver failures
+    ///      (tmux probe error, etc.) exit non-zero rather than
+    ///      silently degrading.
+    ///   2. Without `--commit`: repo-name routing only —
+    ///      `claude-<repo>` prefix match.
+    ///
+    /// Deploy workflows that fire after a merge should pass
+    /// `--commit "$GITHUB_SHA"` (the full 40-char SHA, NOT a short
+    /// SHA — `commits/SHA/pulls` is unreliable with abbreviations)
+    /// so the wake lands on the PR author session, not on whichever
+    /// `claude-<repo>-*` session happens to be open.
     Send {
-        /// Repo name (without owner). E.g. "GitHub.Issues" → tmux session "claude-GitHub-Issues".
+        /// Repo. Bare name (e.g. `VirtualAssistant`) is OK for
+        /// repo-name routing; `--commit` requires the full
+        /// `OWNER/NAME` form.
         #[arg(long)]
         repo: String,
 
         /// Prompt text to type into the session. A newline (Enter) is appended.
         #[arg(long)]
         prompt: String,
+
+        /// Full 40-char commit SHA. When set, routes via the
+        /// PR-author UUID extracted from the PR body. Hard-errors
+        /// on misshaped `--repo`; clean misses (no PR, no marker)
+        /// fall back to repo-name routing; operational resolver
+        /// errors exit non-zero.
+        #[arg(long)]
+        commit: Option<String>,
     },
 
     /// List discovered Claude tmux sessions on this machine.
@@ -127,6 +155,120 @@ enum Command {
     },
 }
 
+/// Routing core for `ghnotify send`. With `--commit`, routes via the
+/// PR-author UUID using the strict pid-index resolver and falls back
+/// to repo-name routing on a clean miss; surfaces operational errors
+/// loudly. Without `--commit`, repo-name routing only.
+async fn send_command(repo: String, prompt: String, commit: Option<String>) -> Result<()> {
+    let session = if let Some(sha) = commit.as_deref() {
+        // Hard-error on a misshaped --repo for --commit: the commits/
+        // SHA/pulls endpoint requires the full OWNER/NAME form. Soft
+        // downgrade hides automation misconfiguration and silently
+        // reintroduces the exact misrouting --commit was added to
+        // prevent.
+        if let Err(msg) = validate_repo_for_commit(&repo) {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+        match resolve_session_via_commit(&repo, sha).await {
+            CommitRouting::Resolved(s) => s,
+            CommitRouting::CleanMiss(reason) => {
+                // Clean miss — no PR yet, no marker in body, session
+                // truly absent on this host. Falling through to repo
+                // routing is the historical behavior; on a machine
+                // whose sessions don't follow `claude-<repo>-*` it
+                // will then fail loudly rather than misrouting.
+                eprintln!("note: --commit lookup did not yield a UUID ({reason}); falling back to repo-name routing");
+                resolve_session_via_repo_or_exit(&repo)
+            }
+            CommitRouting::ResolverError(e) => {
+                // Operational failure in the local UUID resolver
+                // (tmux probing, /proc access, ~/.claude/sessions
+                // unreadable). Surface it instead of swallowing —
+                // this used to silently degrade to repo routing,
+                // which masks regressions in the resolver itself.
+                eprintln!("error: UUID resolver failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        resolve_session_via_repo_or_exit(&repo)
+    };
+
+    match tmux::send_prompt(&session, &prompt)? {
+        tmux::Delivery::Delivered => {
+            println!("delivered prompt to tmux session: {session}");
+            Ok(())
+        }
+        tmux::Delivery::NoSession => {
+            eprintln!("tmux session '{session}' disappeared before send. Use `ghnotify list` to see available sessions.");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Pure validation: `--commit` is only meaningful when paired with
+/// `OWNER/NAME` form because the gh-api endpoint requires it.
+/// Returns the user-facing error message on rejection so the caller
+/// can print it consistently.
+fn validate_repo_for_commit(repo: &str) -> Result<(), String> {
+    if repo.is_empty() {
+        return Err("error: --repo is empty".into());
+    }
+    if !repo.contains('/') {
+        return Err(format!(
+            "error: --commit requires --repo OWNER/NAME (got '{repo}'); refusing to silently downgrade to repo-name routing"
+        ));
+    }
+    Ok(())
+}
+
+/// Result of the `--commit` UUID-routing path. Distinguishes a clean
+/// miss (where falling back to repo routing is reasonable) from an
+/// operational error (where falling back would silently hide a real
+/// problem). The variants exist as data so [`send_command`]'s policy
+/// — fall back vs. exit — is testable and explicit.
+enum CommitRouting {
+    Resolved(String),
+    CleanMiss(&'static str),
+    ResolverError(anyhow::Error),
+}
+
+/// `gh api commits/SHA/pulls` → extract marker → resolve via the
+/// strict pid-index resolver. Caller must validate `repo` shape via
+/// [`validate_repo_for_commit`] first.
+async fn resolve_session_via_commit(repo: &str, sha: &str) -> CommitRouting {
+    let Some(body) = gh_lookup::fetch_pr_body_by_commit(repo, sha).await else {
+        return CommitRouting::CleanMiss("no PR found for this commit");
+    };
+    let Some(uuid) = session_marker::extract_uuid(&body) else {
+        return CommitRouting::CleanMiss("PR body has no claude-session marker");
+    };
+    match session_by_uuid::resolve_tmux_session_strict(&uuid) {
+        Ok(Some(name)) => CommitRouting::Resolved(name),
+        Ok(None) => CommitRouting::CleanMiss("UUID has no live pid-indexed tmux session"),
+        Err(e) => CommitRouting::ResolverError(e),
+    }
+}
+
+/// Repo-name routing: prefix-match `claude-<repo>` against live tmux
+/// sessions. Exits the process on miss — same behavior as the
+/// pre-`--commit` `Send` implementation.
+fn resolve_session_via_repo_or_exit(repo: &str) -> String {
+    let base = tmux::session_name_for_repo(repo);
+    match sessions::resolve_session_for_repo(repo) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("failed to enumerate tmux sessions: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -141,26 +283,11 @@ async fn main() -> Result<()> {
             let cfg = config::load(cli.config.as_deref())?;
             webhook::serve(cfg, bind, one_shot).await
         }
-        Command::Send { repo, prompt } => {
-            let base = tmux::session_name_for_repo(&repo);
-            let session = match sessions::resolve_session_for_repo(&repo)? {
-                Some(s) => s,
-                None => {
-                    eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
-                    std::process::exit(2);
-                }
-            };
-            match tmux::send_prompt(&session, &prompt)? {
-                tmux::Delivery::Delivered => {
-                    println!("delivered prompt to tmux session: {session}");
-                    Ok(())
-                }
-                tmux::Delivery::NoSession => {
-                    eprintln!("tmux session '{session}' disappeared before send. Use `ghnotify list` to see available sessions.");
-                    std::process::exit(2);
-                }
-            }
-        }
+        Command::Send {
+            repo,
+            prompt,
+            commit,
+        } => send_command(repo, prompt, commit).await,
         Command::List => {
             for s in sessions::list_claude_sessions()? {
                 println!("{s}");
@@ -217,6 +344,52 @@ async fn main() -> Result<()> {
             scopes.extend(repo.into_iter().map(install_hook::Scope::Repo));
             scopes.extend(org.into_iter().map(install_hook::Scope::Org));
             install_hook::run(scopes, &url, secret.as_deref(), &events).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_repo_accepts_owner_name() {
+        assert!(validate_repo_for_commit("Olbrasoft/VirtualAssistant").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_rejects_bare_name() {
+        // Bare repo with --commit is the misconfiguration that
+        // silently downgraded to repo routing in the previous
+        // behavior. Must produce a user-facing error so automation
+        // failures are loud.
+        let err = validate_repo_for_commit("VirtualAssistant").unwrap_err();
+        assert!(
+            err.contains("OWNER/NAME"),
+            "error message must explain the required form, got: {err}"
+        );
+        assert!(
+            err.contains("'VirtualAssistant'"),
+            "must echo the bad input"
+        );
+    }
+
+    #[test]
+    fn validate_repo_rejects_empty() {
+        assert!(validate_repo_for_commit("").is_err());
+    }
+
+    #[test]
+    fn commit_routing_clean_miss_carries_reason() {
+        // Sanity: the variant payload is the human-readable reason
+        // we emit on stderr. Asserts the type's contract so
+        // refactors can't accidentally silence the diagnostic.
+        let r = CommitRouting::CleanMiss("PR body has no claude-session marker");
+        match r {
+            CommitRouting::CleanMiss(reason) => {
+                assert!(reason.contains("marker"));
+            }
+            _ => panic!("expected CleanMiss"),
         }
     }
 }
