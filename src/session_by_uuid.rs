@@ -104,8 +104,11 @@ fn resolve_via_cwd_basename(uuid: &str) -> Result<Option<String>> {
     let Some(bare) = cwd.file_name().and_then(|s| s.to_str()) else {
         return Ok(None);
     };
-    let base = tmux::session_name_for_repo(bare);
-    let sessions = sessions::list_claude_sessions_full()?;
+    // This entire resolver path is Claude-specific (the JSONL it reads above
+    // lives under `~/.claude/projects/`), so the agent is fixed. Sub-issue
+    // #27 adds the parallel Codex resolver against `~/.codex/sessions/`.
+    let base = tmux::session_name_for_repo(bare, crate::agent::Agent::claude());
+    let sessions = sessions::list_agent_sessions_full()?;
     Ok(sessions::pick_session(&sessions, &base))
 }
 

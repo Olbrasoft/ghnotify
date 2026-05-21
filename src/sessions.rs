@@ -1,16 +1,21 @@
-//! Discovery of Claude tmux sessions and basic doctor diagnostics.
+//! Discovery of agent tmux sessions and basic doctor diagnostics.
 //!
-//! Session routing background: Claude Code sessions live in tmux sessions whose
-//! names are produced by the `claude()` bash wrapper. Historically the wrapper
-//! named sessions exactly `claude-<repo>` and ghnotify routed by exact match.
-//! Some users run a wrapper variant that appends a per-terminal suffix
-//! (`claude-<repo>-<tty>`) so two terminals in the same repo don't collide.
+//! Session routing background: Each agent (Claude Code, Codex) runs in tmux
+//! sessions whose names are produced by the matching bash wrapper. Historically
+//! the wrapper named sessions exactly `claude-<repo>` and ghnotify routed by
+//! exact match. Some users run a wrapper variant that appends a per-terminal
+//! suffix (`claude-<repo>-<tty>`) so two terminals in the same repo don't
+//! collide. The Codex wrapper mirrors the same scheme with the `codex-` prefix.
 //! To support both layouts, we route by *prefix*: a webhook for repo `cr`
-//! matches either `claude-cr` or `claude-cr-<anything>`.
+//! matches either `claude-cr` / `claude-cr-<anything>` (for a Claude target)
+//! or `codex-cr` / `codex-cr-<anything>` (for a Codex target). The agent that
+//! owns a given session is recovered from the prefix via
+//! [`Agent::from_tmux_session_name`].
 
 use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
+use crate::agent::{Agent, AgentKind};
 use crate::tmux;
 
 /// One tmux session as reported by `tmux list-sessions`, with the fields we
@@ -23,18 +28,26 @@ pub struct SessionInfo {
     pub attached: bool,
     /// `#{session_created}` — unix seconds; larger = newer.
     pub created: u64,
+    /// Which agent owns this session, recovered from the name's prefix at
+    /// parse time. Carried alongside the session so downstream routing can
+    /// log "delivered to Codex" without re-doing the prefix lookup, and so
+    /// agent-agnostic selection can compare candidates across agents in one
+    /// pass.
+    pub kind: AgentKind,
 }
 
-/// List tmux sessions whose name starts with "claude-" (names only).
-pub fn list_claude_sessions() -> Result<Vec<String>> {
-    Ok(list_claude_sessions_full()?
+/// List tmux sessions owned by any known agent (names only).
+pub fn list_agent_sessions() -> Result<Vec<String>> {
+    Ok(list_agent_sessions_full()?
         .into_iter()
         .map(|s| s.name)
         .collect())
 }
 
-/// List claude-* sessions with attached+created metadata.
-pub fn list_claude_sessions_full() -> Result<Vec<SessionInfo>> {
+/// List agent-owned tmux sessions with attached+created metadata. The result
+/// includes both `claude-*` and `codex-*` sessions; per-agent filtering is
+/// the caller's responsibility (see [`resolve_session_for_repo`]).
+pub fn list_agent_sessions_full() -> Result<Vec<SessionInfo>> {
     let out = Command::new("tmux")
         .args([
             "list-sessions",
@@ -68,40 +81,62 @@ pub fn list_claude_sessions_full() -> Result<Vec<SessionInfo>> {
 }
 
 /// Parse the tab-separated output of our `tmux list-sessions -F` call.
-/// Silently skips unparseable lines and non-claude sessions.
+/// Silently skips unparseable lines and non-agent sessions (anything whose
+/// name doesn't start with a registered agent's `tmux_prefix`).
 pub fn parse_tmux_list(s: &str) -> Vec<SessionInfo> {
     s.lines()
         .filter_map(|line| {
             let mut it = line.split('\t');
             let name = it.next()?.trim();
-            if !name.starts_with("claude-") {
-                return None;
-            }
+            // Recover the owning agent from the name's prefix; non-agent
+            // sessions (the user's `work`, `dotfiles`, …) drop out here.
+            let agent = Agent::from_tmux_session_name(name)?;
             let attached = it.next()?.trim().parse::<u32>().ok()? > 0;
             let created = it.next()?.trim().parse::<u64>().ok()?;
             Some(SessionInfo {
                 name: name.to_string(),
                 attached,
                 created,
+                kind: agent.kind,
             })
         })
         .collect()
 }
 
-/// Resolve the tmux session to deliver a prompt for `repo` into.
+/// Resolve the tmux session to deliver a prompt for `repo` into, scoped to a
+/// specific agent.
 ///
-/// Matches `claude-<bare-repo>` exactly, or any `claude-<bare-repo>-<suffix>`
-/// session. Among candidates, prefers attached sessions, then the most
-/// recently created one — that disambiguates old orphan sessions from the
-/// live tty-suffixed one, and picks the freshest terminal when the user has
-/// multiple open on the same repo.
+/// Matches `<prefix><bare-repo>` exactly, or any `<prefix><bare-repo>-<suffix>`
+/// session, where `<prefix>` is the agent's `tmux_prefix`. Among candidates,
+/// prefers attached sessions, then the most recently created one — that
+/// disambiguates old orphan sessions from the live tty-suffixed one, and
+/// picks the freshest terminal when the user has multiple open on the same
+/// repo.
 ///
 /// Returns `None` when no matching session exists (caller should treat as a
 /// soft discard, not an error).
-pub fn resolve_session_for_repo(repo: &str) -> Result<Option<String>> {
-    let base = tmux::session_name_for_repo(repo);
-    let sessions = list_claude_sessions_full()?;
+pub fn resolve_session_for_repo(repo: &str, agent: &Agent) -> Result<Option<String>> {
+    let base = tmux::session_name_for_repo(repo, agent);
+    let sessions = list_agent_sessions_full()?;
     Ok(pick_session(&sessions, &base))
+}
+
+/// Agent-agnostic counterpart to [`resolve_session_for_repo`]. Considers
+/// candidates from *every* registered agent for the same repo and picks
+/// the best one by the standard rule: **prefer attached sessions over
+/// detached ones; among ties, the session with the higher `session_created`
+/// timestamp wins**. tmux doesn't expose a "last activity" timestamp, so
+/// creation time is our recency proxy — newer sessions tend to be the
+/// ones the user just opened and is actively working in.
+///
+/// This is the routing path for webhooks that arrive **without** a PR
+/// marker — there's no signal telling us which agent the wake belongs to,
+/// so the rule above decides. When only one agent has a session for the
+/// repo (the common case), the result is identical to calling
+/// [`resolve_session_for_repo`] with that agent.
+pub fn resolve_session_for_repo_any(repo: &str) -> Result<Option<String>> {
+    let sessions = list_agent_sessions_full()?;
+    Ok(pick_session_any(&sessions, repo))
 }
 
 /// Pure core of [`resolve_session_for_repo`]. Given a set of live sessions and
@@ -114,6 +149,35 @@ pub fn pick_session(sessions: &[SessionInfo], base: &str) -> Option<String> {
         .collect();
     // Prefer attached, then most-recently created. Stable sort preserves
     // tmux's list order as a final tiebreak for determinism in tests.
+    candidates.sort_by(|a, b| {
+        b.attached
+            .cmp(&a.attached)
+            .then_with(|| b.created.cmp(&a.created))
+    });
+    candidates.first().map(|s| s.name.clone())
+}
+
+/// Pure core of [`resolve_session_for_repo_any`]. Looks at every registered
+/// agent's base name for `repo` and applies the standard selection rule
+/// across the *union* of matches.
+///
+/// Implementation note: we deliberately iterate by agent and collect into a
+/// single candidate pool rather than running [`pick_session`] per-agent and
+/// then comparing the per-agent winners. The latter would break the
+/// "attached beats unattached" guarantee in edge cases where one agent has
+/// an attached but stale session and the other has an unattached but fresh
+/// one — we want one ordered choice across the whole pool, not a tournament.
+pub fn pick_session_any(sessions: &[SessionInfo], repo: &str) -> Option<String> {
+    let mut candidates: Vec<&SessionInfo> = Vec::new();
+    for agent in Agent::all() {
+        let base = tmux::session_name_for_repo(repo, agent);
+        let prefix = format!("{base}-");
+        for s in sessions {
+            if s.name == base || s.name.starts_with(&prefix) {
+                candidates.push(s);
+            }
+        }
+    }
     candidates.sort_by(|a, b| {
         b.attached
             .cmp(&a.attached)
@@ -163,14 +227,23 @@ pub fn doctor() -> Result<()> {
         _ => check("claude code", false, "not on PATH"),
     }
 
+    // codex binary
+    let codex = Command::new("codex").arg("--version").output();
+    match codex {
+        Ok(o) if o.status.success() => {
+            check("codex", true, String::from_utf8_lossy(&o.stdout).trim());
+        }
+        _ => check("codex", false, "not on PATH (optional)"),
+    }
+
     // sessions
-    let sessions = list_claude_sessions().unwrap_or_default();
+    let sessions = list_agent_sessions().unwrap_or_default();
     let detail = if sessions.is_empty() {
-        "(none — start a Claude session in some repo)".to_string()
+        "(none — start a Claude or Codex session in some repo)".to_string()
     } else {
         sessions.join(", ")
     };
-    check("claude tmux sessions", !sessions.is_empty(), &detail);
+    check("agent tmux sessions", !sessions.is_empty(), &detail);
 
     Ok(())
 }
@@ -179,11 +252,23 @@ pub fn doctor() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Test helper. Infers the agent kind from the session name's prefix
+    /// so test inputs stay terse — `s("claude-cr", …)` and
+    /// `s("codex-cr", …)` both produce correctly-tagged `SessionInfo`s
+    /// without the call sites having to spell out `AgentKind` literals.
     fn s(name: &str, attached: bool, created: u64) -> SessionInfo {
+        let kind = Agent::from_tmux_session_name(name)
+            .map(|a| a.kind)
+            // Tests passing a non-agent name are exercising the "ignore
+            // anything not ours" path, so defaulting to Claude is safe —
+            // such inputs never make it past the parse filter and never
+            // reach the candidate pool.
+            .unwrap_or(AgentKind::Claude);
         SessionInfo {
             name: name.to_string(),
             attached,
             created,
+            kind,
         }
     }
 
@@ -196,11 +281,31 @@ claude-ghnotify-pts-8\t1\t1776542386
 other-session\t1\t1776542386
 ";
         let got = parse_tmux_list(input);
-        assert_eq!(got.len(), 3, "non-claude sessions must be filtered");
+        assert_eq!(got.len(), 3, "non-agent sessions must be filtered");
         assert_eq!(got[0].name, "claude-cr");
+        assert_eq!(got[0].kind, AgentKind::Claude);
         assert!(!got[0].attached);
         assert_eq!(got[1].name, "claude-cr-pts-2");
         assert!(got[1].attached);
+    }
+
+    #[test]
+    fn parse_tmux_list_recognizes_codex_sessions() {
+        // Mixed Claude + Codex tmux output. Both must come through with the
+        // correct AgentKind; the dual-prefix filter is the single biggest
+        // behavioral change in this sub-issue, so guard it explicitly.
+        let input = "\
+claude-cr-pts-2\t1\t100
+codex-ghnotify-pts-7\t1\t200
+codex-cr\t0\t150
+work\t1\t300
+";
+        let got = parse_tmux_list(input);
+        assert_eq!(got.len(), 3, "only claude-* and codex-* must survive");
+        assert_eq!(got[0].kind, AgentKind::Claude);
+        assert_eq!(got[1].kind, AgentKind::Codex);
+        assert_eq!(got[1].name, "codex-ghnotify-pts-7");
+        assert_eq!(got[2].kind, AgentKind::Codex);
     }
 
     #[test]
@@ -284,7 +389,7 @@ claude-missing-field\t1
     fn pick_handles_dot_in_repo_via_session_name_helper() {
         // GitHub.Issues → claude-GitHub-Issues; suffixed variant also matches.
         let sessions = vec![s("claude-GitHub-Issues-pts-9", true, 100)];
-        let base = crate::tmux::session_name_for_repo("GitHub.Issues");
+        let base = crate::tmux::session_name_for_repo("GitHub.Issues", Agent::claude());
         assert_eq!(
             pick_session(&sessions, &base),
             Some("claude-GitHub-Issues-pts-9".into())
@@ -312,5 +417,56 @@ claude-missing-field\t1
             pick_session(&sessions, "claude-cr"),
             Some("claude-cr-pts-2".into())
         );
+    }
+
+    #[test]
+    fn pick_session_any_falls_through_to_codex_when_only_codex_exists() {
+        // No Claude session for "cr"; only Codex. Agent-agnostic resolution
+        // must still find it.
+        let sessions = vec![s("codex-cr-pts-7", true, 100)];
+        assert_eq!(
+            pick_session_any(&sessions, "cr"),
+            Some("codex-cr-pts-7".into())
+        );
+    }
+
+    #[test]
+    fn pick_session_any_picks_newer_attached_across_agents() {
+        // Both agents have an attached session for the same repo. The
+        // recency tiebreak (newest `created`) decides — here Codex's
+        // session is fresher, so it wins.
+        let sessions = vec![
+            s("claude-cr-pts-2", true, 100),
+            s("codex-cr-pts-7", true, 200),
+        ];
+        assert_eq!(
+            pick_session_any(&sessions, "cr"),
+            Some("codex-cr-pts-7".into())
+        );
+    }
+
+    #[test]
+    fn pick_session_any_prefers_attached_across_agents() {
+        // Cross-agent variant of the "attached beats orphan" rule. Here
+        // Codex is detached but newer, Claude is attached but older —
+        // attached wins, so Claude is the answer. Documents that recency
+        // is the *secondary* key, not primary.
+        let sessions = vec![
+            s("claude-cr-pts-2", true, 100),
+            s("codex-cr-pts-7", false, 999),
+        ];
+        assert_eq!(
+            pick_session_any(&sessions, "cr"),
+            Some("claude-cr-pts-2".into())
+        );
+    }
+
+    #[test]
+    fn pick_session_any_returns_none_when_no_agent_owns_the_repo() {
+        let sessions = vec![
+            s("claude-other-pts-1", true, 100),
+            s("codex-different-pts-2", true, 200),
+        ];
+        assert_eq!(pick_session_any(&sessions, "cr"), None);
     }
 }

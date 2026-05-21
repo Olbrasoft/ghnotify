@@ -255,9 +255,16 @@ async fn resolve_session_via_commit(repo: &str, sha: &str) -> CommitRouting {
 /// Repo-name routing: prefix-match `claude-<repo>` against live tmux
 /// sessions. Exits the process on miss — same behavior as the
 /// pre-`--commit` `Send` implementation.
+///
+/// Currently scoped to Claude. The agent-agnostic / Codex-aware variant
+/// arrives in sub-issue #29 (webhook orchestration); this CLI path is
+/// dispatch-aware only when the caller knows the agent, which `ghnotify send`
+/// doesn't (yet). Until #29 lands, `send` keeps its historical Claude-only
+/// semantics so the user-visible behavior is unchanged.
 fn resolve_session_via_repo_or_exit(repo: &str) -> String {
-    let base = tmux::session_name_for_repo(repo);
-    match sessions::resolve_session_for_repo(repo) {
+    let agent = agent::Agent::claude();
+    let base = tmux::session_name_for_repo(repo, agent);
+    match sessions::resolve_session_for_repo(repo, agent) {
         Ok(Some(s)) => s,
         Ok(None) => {
             eprintln!("no tmux session for repo '{repo}' (looked for '{base}' or '{base}-*'). Use `ghnotify list` to see available sessions.");
@@ -290,7 +297,10 @@ async fn main() -> Result<()> {
             commit,
         } => send_command(repo, prompt, commit).await,
         Command::List => {
-            for s in sessions::list_claude_sessions()? {
+            // Lists every agent-owned session (Claude + Codex). Per-agent
+            // filtering isn't useful for the `list` UX — users want to see
+            // every session ghnotify could possibly deliver to.
+            for s in sessions::list_agent_sessions()? {
                 println!("{s}");
             }
             Ok(())

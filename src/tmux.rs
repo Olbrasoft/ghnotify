@@ -1,17 +1,20 @@
 //! tmux send-keys wrapper. The single mechanism by which we deliver prompts
-//! into a running Claude Code session.
+//! into a running agent session.
 
 use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
-/// Convert a repo name (with possible dots) to the tmux session name our
-/// `claude()` bash wrapper uses. Must stay in lockstep with `~/.bashrc`.
+use crate::agent::Agent;
+
+/// Convert a repo name (with possible dots) to the tmux session name a given
+/// agent's bash wrapper uses. Must stay in lockstep with `~/.bashrc`.
 ///
-/// E.g. "GitHub.Issues" → "claude-GitHub-Issues".
-pub fn session_name_for_repo(repo: &str) -> String {
+/// E.g. for `Agent::claude()`: "GitHub.Issues" → "claude-GitHub-Issues".
+/// For `Agent::codex()`:         "GitHub.Issues" → "codex-GitHub-Issues".
+pub fn session_name_for_repo(repo: &str, agent: &Agent) -> String {
     // Strip "owner/" if present.
     let bare = repo.rsplit('/').next().unwrap_or(repo);
-    format!("claude-{}", bare.replace('.', "-"))
+    format!("{}{}", agent.tmux_prefix, bare.replace('.', "-"))
 }
 
 /// Returns true if a tmux session with this name exists.
