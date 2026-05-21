@@ -411,7 +411,10 @@ fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
         _ => None,
     }?
     .as_str()?;
-    session_marker::extract_uuid(body)
+    // Claude-tag only for now; sub-issue #29 swaps this for
+    // `session_marker::extract_marker(body)` and dispatches on the
+    // returned AgentKind to pick the right resolver downstream.
+    session_marker::extract_uuid(body, crate::agent::Agent::claude().pr_marker_tag)
 }
 
 /// Outcome of aggregate-refining a `check_suite` wake.
@@ -725,7 +728,10 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
             gh_lookup::fetch_pr_body_by_commit(full_name, &sha).await?
         }
     };
-    session_marker::extract_uuid(&body)
+    // Claude-tag only for now; sub-issue #29 swaps this for
+    // `session_marker::extract_marker(&body)` so check_suite wakes can
+    // also route into Codex sessions when the PR was authored by Codex.
+    session_marker::extract_uuid(&body, crate::agent::Agent::claude().pr_marker_tag)
 }
 
 /// Which gh-API endpoint is usable for extracting the PR body from a

@@ -242,7 +242,12 @@ async fn resolve_session_via_commit(repo: &str, sha: &str) -> CommitRouting {
     let Some(body) = gh_lookup::fetch_pr_body_by_commit(repo, sha).await else {
         return CommitRouting::CleanMiss("no PR found for this commit");
     };
-    let Some(uuid) = session_marker::extract_uuid(&body) else {
+    // `send --commit` resolves via the Claude-only strict pid-index path
+    // (see [`session_by_uuid::resolve_tmux_session_strict`]) so only the
+    // Claude marker is meaningful here. Sub-issues #27 / #29 wire the
+    // parallel Codex resolver and switch this call to `extract_marker`.
+    let Some(uuid) = session_marker::extract_uuid(&body, agent::Agent::claude().pr_marker_tag)
+    else {
         return CommitRouting::CleanMiss("PR body has no claude-session marker");
     };
     match session_by_uuid::resolve_tmux_session_strict(&uuid) {
