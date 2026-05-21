@@ -3,14 +3,16 @@
 //! top of every PR body via `gh pr create`.
 //!
 //! Why this exists: ghnotify's default routing picks the tmux session by
-//! repo name (`<prefix><repo>` for the relevant agent). That breaks when a
-//! session running in one directory creates a PR in a *different* repo —
-//! e.g. a session in `/home/jirka/imdb` opening a PR on `Olbrasoft/cr`. The
-//! event repo is `cr`, so repo-routing delivers the review wake to any
-//! `<prefix>-cr-*` session (usually a wrong, unrelated one) instead of the
-//! author. The author marker makes the routing author-scoped: the wake
-//! goes to the session that opened the PR, not to whichever session
-//! happens to have the event's repo cwd.
+//! repo name — `claude-<repo>` for a Claude target, `codex-<repo>` for a
+//! Codex target (`Agent::tmux_prefix` already includes the trailing hyphen,
+//! so the composed names never double-hyphen). That breaks when a session
+//! running in one directory creates a PR in a *different* repo — e.g. a
+//! session in `/home/jirka/imdb` opening a PR on `Olbrasoft/cr`. The event
+//! repo is `cr`, so repo-routing delivers the review wake to any
+//! `claude-cr-*` (or `codex-cr-*`) session — usually a wrong, unrelated one
+//! — instead of the author. The author marker makes the routing
+//! author-scoped: the wake goes to the session that opened the PR, not to
+//! whichever session happens to have the event's repo cwd.
 //!
 //! The marker is a conventional HTML comment so it renders invisibly on
 //! GitHub. The UUID is the agent's session id — for Claude, the filename
