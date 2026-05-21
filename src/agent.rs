@@ -8,20 +8,14 @@
 //!
 //! Rather than scatter `if claude { … } else { … }` across the codebase, this
 //! module captures the per-agent constants as data and exposes them as
-//! `&'static Agent` references. Downstream modules accept `&Agent` and read
-//! the prefix / marker / triggers off of it. Adding a third agent later is
-//! one new `static` and one entry in [`ALL`].
+//! `&'static Agent` references via `Agent::claude()`, `Agent::codex()`,
+//! `Agent::all()`, and `Agent::from_tmux_session_name(name)`. Downstream
+//! modules accept `&Agent` and read the prefix / marker / triggers off of it.
+//! Adding a third agent later is one new `static` and one entry in [`ALL`].
 //!
 //! The values here MUST stay in lockstep with the bash wrappers in
 //! `~/.bashrc` (which name the tmux sessions) and with the documented PR
 //! marker convention in the user's global Claude/Codex instructions.
-
-// This module is the foundation for the dual-agent refactor (parent #23).
-// Its items become live as later sub-issues wire them into sessions /
-// session_marker / session_by_uuid / event / webhook. Until then the unused
-// statics and helpers would emit `dead_code` warnings on every build — silence
-// them at the module boundary so this staged refactor doesn't add noise.
-#![allow(dead_code)]
 
 /// Which coding agent a session belongs to.
 ///
@@ -37,7 +31,12 @@ pub enum AgentKind {
 ///
 /// All fields are `&'static` so the per-agent value can itself be a `static`
 /// — no allocation, no clones, callers borrow.
+// The `pub` fields are read by sub-issues #25–#29 (sessions.rs / session_marker.rs
+// / event.rs). Until those land, suppress dead-code at field granularity; the
+// warnings will surface again automatically for any field added later that
+// nothing consumes.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Agent {
     pub kind: AgentKind,
     /// Prefix of every tmux session name owned by this agent. Includes the
@@ -50,20 +49,26 @@ pub struct Agent {
     /// UUID from a webhook payload.
     pub pr_marker_tag: &'static str,
     /// Substrings in an issue-comment body that explicitly address this
-    /// agent. Matching is via `body.contains(trigger)` upstream, so order
-    /// here is purely documentary (longest-most-specific first by
-    /// convention).
+    /// agent. The current consumer in `event.rs` applies two different
+    /// match modes by trigger shape — `@`-mention triggers are matched
+    /// with `body.contains(trigger)`, `/`-slash triggers with
+    /// `body.lines().any(|l| l.trim_start().starts_with(trigger))`. This
+    /// list captures the trigger strings only; sub-issue #28 will migrate
+    /// the consumer to drive matching off this list directly and may at
+    /// that point introduce an explicit per-trigger match mode (e.g.
+    /// `enum TriggerMatch { Contains, LineStartsWith }`). Order here is
+    /// purely documentary (longest-most-specific first by convention).
     pub mention_triggers: &'static [&'static str],
 }
 
-pub static CLAUDE: Agent = Agent {
+static CLAUDE: Agent = Agent {
     kind: AgentKind::Claude,
     tmux_prefix: "claude-",
     pr_marker_tag: "claude-session",
     mention_triggers: &["@claude-cr", "@claude", "/claude"],
 };
 
-pub static CODEX: Agent = Agent {
+static CODEX: Agent = Agent {
     kind: AgentKind::Codex,
     tmux_prefix: "codex-",
     pr_marker_tag: "codex-session",
@@ -79,15 +84,40 @@ pub static CODEX: Agent = Agent {
 /// could if a body is hand-edited), the earlier entry wins. Claude is first
 /// for historical-compatibility reasons — Claude-only setups must behave
 /// identically to before this change.
-pub static ALL: &[&Agent] = &[&CLAUDE, &CODEX];
+static ALL: &[&Agent] = &[&CLAUDE, &CODEX];
 
-/// Identify the agent that owns a tmux session, based on its name prefix.
-///
-/// Returns `None` for non-agent sessions (anything that doesn't start with
-/// one of the known prefixes), so callers can filter `tmux list-sessions`
-/// output through this without a separate "is it ours?" check.
-pub fn from_tmux_session_name(name: &str) -> Option<&'static Agent> {
-    ALL.iter().copied().find(|a| name.starts_with(a.tmux_prefix))
+// Most of this impl is wired in by sub-issues #25-#29 of parent #23. Until
+// then the associated functions look unused. Allow is scoped to this block
+// (not the whole module) so dead-code warnings come back automatically for
+// anything else we add later but forget to wire up.
+#[allow(dead_code)]
+impl Agent {
+    /// The Claude Code agent.
+    pub fn claude() -> &'static Agent {
+        &CLAUDE
+    }
+
+    /// The Codex agent.
+    pub fn codex() -> &'static Agent {
+        &CODEX
+    }
+
+    /// Every agent ghnotify routes for. See [`ALL`] for ordering semantics.
+    pub fn all() -> &'static [&'static Agent] {
+        ALL
+    }
+
+    /// Identify the agent that owns a tmux session, based on its name prefix.
+    ///
+    /// Returns `None` for non-agent sessions (anything that doesn't start
+    /// with one of the known prefixes), so callers can filter
+    /// `tmux list-sessions` output through this without a separate
+    /// "is it ours?" check.
+    pub fn from_tmux_session_name(name: &str) -> Option<&'static Agent> {
+        ALL.iter()
+            .copied()
+            .find(|a| name.starts_with(a.tmux_prefix))
+    }
 }
 
 #[cfg(test)]
@@ -100,12 +130,13 @@ mod tests {
         // sessions.rs, session_marker.rs, event.rs. This test pins them so
         // any drift between the bash wrapper convention and ghnotify's
         // routing is caught locally instead of by misrouted wakes in prod.
-        assert_eq!(CLAUDE.kind, AgentKind::Claude);
-        assert_eq!(CLAUDE.tmux_prefix, "claude-");
-        assert_eq!(CLAUDE.pr_marker_tag, "claude-session");
-        assert!(CLAUDE.mention_triggers.contains(&"@claude"));
-        assert!(CLAUDE.mention_triggers.contains(&"@claude-cr"));
-        assert!(CLAUDE.mention_triggers.contains(&"/claude"));
+        let claude = Agent::claude();
+        assert_eq!(claude.kind, AgentKind::Claude);
+        assert_eq!(claude.tmux_prefix, "claude-");
+        assert_eq!(claude.pr_marker_tag, "claude-session");
+        assert!(claude.mention_triggers.contains(&"@claude"));
+        assert!(claude.mention_triggers.contains(&"@claude-cr"));
+        assert!(claude.mention_triggers.contains(&"/claude"));
     }
 
     #[test]
@@ -114,22 +145,23 @@ mod tests {
         // this asserts ghnotify's view of that prefix doesn't drift from the
         // wrapper. Same for the PR marker convention documented in
         // ~/.codex/AGENTS.md.
-        assert_eq!(CODEX.kind, AgentKind::Codex);
-        assert_eq!(CODEX.tmux_prefix, "codex-");
-        assert_eq!(CODEX.pr_marker_tag, "codex-session");
-        assert!(CODEX.mention_triggers.contains(&"@codex"));
-        assert!(CODEX.mention_triggers.contains(&"/codex"));
+        let codex = Agent::codex();
+        assert_eq!(codex.kind, AgentKind::Codex);
+        assert_eq!(codex.tmux_prefix, "codex-");
+        assert_eq!(codex.pr_marker_tag, "codex-session");
+        assert!(codex.mention_triggers.contains(&"@codex"));
+        assert!(codex.mention_triggers.contains(&"/codex"));
     }
 
     #[test]
     fn from_tmux_session_name_identifies_claude_sessions() {
-        let agent = from_tmux_session_name("claude-cr-pts-2").unwrap();
+        let agent = Agent::from_tmux_session_name("claude-cr-pts-2").unwrap();
         assert_eq!(agent.kind, AgentKind::Claude);
     }
 
     #[test]
     fn from_tmux_session_name_identifies_codex_sessions() {
-        let agent = from_tmux_session_name("codex-ghnotify-pts-7").unwrap();
+        let agent = Agent::from_tmux_session_name("codex-ghnotify-pts-7").unwrap();
         assert_eq!(agent.kind, AgentKind::Codex);
     }
 
@@ -139,8 +171,8 @@ mod tests {
         // match. This is the routing's main false-positive guardrail —
         // anything else in `tmux list-sessions` (a user's `work`, `dotfiles`,
         // etc.) must be ignored by ghnotify.
-        assert!(from_tmux_session_name("work").is_none());
-        assert!(from_tmux_session_name("dotfiles-pts-1").is_none());
+        assert!(Agent::from_tmux_session_name("work").is_none());
+        assert!(Agent::from_tmux_session_name("dotfiles-pts-1").is_none());
     }
 
     #[test]
@@ -148,16 +180,17 @@ mod tests {
         // The trailing hyphen in each agent's prefix is load-bearing: it
         // ensures a hypothetical `claudex-foo` session doesn't get
         // misclassified as Claude. The prefix is `"claude-"`, not `"claude"`.
-        assert!(from_tmux_session_name("claudex-foo").is_none());
-        assert!(from_tmux_session_name("codexy-bar").is_none());
+        assert!(Agent::from_tmux_session_name("claudex-foo").is_none());
+        assert!(Agent::from_tmux_session_name("codexy-bar").is_none());
     }
 
     #[test]
     fn all_lists_both_agents_in_routing_precedence_order() {
         // Claude first preserves backward compatibility for the
         // double-marker edge case documented in [`ALL`].
-        assert_eq!(ALL.len(), 2);
-        assert_eq!(ALL[0].kind, AgentKind::Claude);
-        assert_eq!(ALL[1].kind, AgentKind::Codex);
+        let all = Agent::all();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].kind, AgentKind::Claude);
+        assert_eq!(all[1].kind, AgentKind::Codex);
     }
 }
