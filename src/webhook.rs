@@ -322,6 +322,13 @@ async fn process_webhook(
         }
     };
 
+    // Resolved agent — derived once from the session name's prefix and
+    // reused for both the strict issue_comment filter immediately below
+    // and the delivery log further down. Re-deriving in two spots
+    // would risk the log and the filter going out of sync if either
+    // call site is ever changed.
+    let resolved_agent = Agent::from_tmux_session_name(&session);
+
     // 4a. Strict agent-mention filter for issue_comment events.
     //     `event::classify` is agent-permissive (it forwards any agent's
     //     trigger), so a comment with only `@codex please review` makes
@@ -330,40 +337,30 @@ async fn process_webhook(
     //     misroute issue #28's acceptance criterion calls out. Drop now
     //     when the comment doesn't address the resolved session's
     //     agent.
-    if event_type == "issue_comment" {
-        let resolved_agent = Agent::from_tmux_session_name(&session);
-        let comment_body = payload
-            .pointer("/comment/body")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if let Some(agent) = resolved_agent {
-            if !event::body_addresses_agent(comment_body, agent) {
-                info!(
-                    session,
-                    via,
-                    event_type,
-                    agent_kind = ?agent.kind,
-                    "issue_comment does not address the resolved session's agent, event discarded"
-                );
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "discarded": true,
-                        "reason": "comment trigger does not match resolved session's agent",
-                        "session": session,
-                        "via": via,
-                    })),
-                );
-            }
-        }
+    if issue_comment_mismatches_agent(event_type, &payload, resolved_agent) {
+        info!(
+            session,
+            via,
+            event_type,
+            agent_kind = ?resolved_agent.map(|a| a.kind),
+            "issue_comment does not address the resolved session's agent, event discarded"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "discarded": true,
+                "reason": "comment trigger does not match resolved session's agent",
+                "session": session,
+                "via": via,
+            })),
+        );
     }
 
-    // The resolved session's agent — derived from the prefix on its
-    // name — is included in the delivery log so an operator scanning
-    // the journal can tell at a glance whether a wake landed in
-    // Claude or Codex.
-    let agent_kind = Agent::from_tmux_session_name(&session).map(|a| a.kind);
+    // The resolved session's agent kind is included in the delivery log
+    // so an operator scanning the journal can tell at a glance whether
+    // a wake landed in Claude or Codex.
+    let agent_kind = resolved_agent.map(|a| a.kind);
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
             info!(session, via, event_type, agent_kind = ?agent_kind, "prompt delivered");
@@ -450,6 +447,33 @@ async fn resolve_target_session(
         Some(name) => Ok(Some((name, "repo"))),
         None => Ok(None),
     }
+}
+
+/// Decide whether an issue_comment event should be discarded because
+/// its comment body doesn't address the resolved session's agent.
+///
+/// Pure function of (event_type, payload, resolved_agent) so the
+/// discard policy is unit-testable without spinning up the axum
+/// handler. Returns `false` for any non-`issue_comment` event (the
+/// rule only applies to comments) and for the unusual case where the
+/// resolved session name doesn't match any known agent prefix (can't
+/// decide → don't drop).
+fn issue_comment_mismatches_agent(
+    event_type: &str,
+    payload: &Value,
+    resolved_agent: Option<&'static Agent>,
+) -> bool {
+    if event_type != "issue_comment" {
+        return false;
+    }
+    let Some(agent) = resolved_agent else {
+        return false;
+    };
+    let body = payload
+        .pointer("/comment/body")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    !event::body_addresses_agent(body, agent)
 }
 
 /// Extract the agent-session marker from fields directly present in the
@@ -1144,5 +1168,96 @@ mod tests {
         );
         let just_below = entry("queued", None, 0, STUCK_QUEUED_AGE_THRESHOLD_S - 0.1);
         assert!(!just_below.is_stuck_queued());
+    }
+
+    // ---- issue_comment_mismatches_agent ----
+
+    fn comment_payload(body: &str) -> Value {
+        json!({
+            "action": "created",
+            "comment": { "body": body, "user": { "login": "alice" } },
+            "issue": { "number": 5 },
+        })
+    }
+
+    #[test]
+    fn issue_comment_mismatches_when_codex_comment_resolves_to_claude() {
+        // The core scenario issue #28's strict acceptance criterion calls
+        // out: a `@codex` comment must NOT wake a Claude session. The
+        // strict filter discards.
+        let payload = comment_payload("Hey @codex please review");
+        assert!(issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::claude())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_matches_when_codex_comment_resolves_to_codex() {
+        // Same payload, but the resolved session is the agent the
+        // comment actually addressed — wake forwards.
+        let payload = comment_payload("Hey @codex please review");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::codex())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_mismatches_when_claude_comment_resolves_to_codex() {
+        // Symmetric: a Claude-only mention must NOT wake Codex.
+        let payload = comment_payload("@claude-cr take a look");
+        assert!(issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::codex())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_matches_when_claude_comment_resolves_to_claude() {
+        let payload = comment_payload("/claude do the thing");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::claude())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_mismatch_rule_does_not_apply_to_other_event_types() {
+        // The strict filter is scoped to issue_comment only. CI wakes,
+        // PR-review wakes, etc. don't have an addresses-an-agent
+        // concept — they fire because of the event itself, not because
+        // someone typed a trigger. The filter must not affect them.
+        let payload = comment_payload("@codex please review");
+        for evt in [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "check_suite",
+            "ping",
+        ] {
+            assert!(
+                !issue_comment_mismatches_agent(evt, &payload, Some(Agent::claude())),
+                "filter must not apply to event_type={evt}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_comment_mismatch_returns_false_when_resolved_agent_unknown() {
+        // Edge case: the resolved session name doesn't match any known
+        // prefix (shouldn't happen in practice — sessions::pick_session
+        // only returns names that started with an agent prefix — but
+        // documents the cautious "can't decide → don't drop" policy).
+        let payload = comment_payload("@codex please review");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            None
+        ));
     }
 }
