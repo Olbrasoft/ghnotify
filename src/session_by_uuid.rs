@@ -1,33 +1,42 @@
-//! Resolve a Claude session UUID to the tmux session hosting it.
+//! Resolve an agent session UUID to the tmux session hosting it.
 //!
-//! Two-tier strategy, in order:
+//! Two-tier strategy, applied independently per agent (Claude or Codex)
+//! since the on-disk layout differs:
 //!
-//! 1. **Pid index** (preferred). Every running Claude writes
-//!    `~/.claude/sessions/<pid>.json` containing its own `pid` and
-//!    `sessionId`. We scan that directory, find the entry whose
-//!    `sessionId` matches the marker UUID, and walk that pid's parent
-//!    chain in `/proc` until we hit a tmux pane's `pane_pid`. That pane
-//!    determines the exact tmux session — even when two Claude sessions
-//!    share a cwd. This is the only routing path that distinguishes
-//!    `claude-cr-pts-2` (PR author) from `claude-cr-pts-7` (a different
-//!    session that happens to be open in the same repo cwd).
+//! 1. **Pid index** (preferred). Every running agent writes a tiny JSON
+//!    descriptor with its own `pid` and `sessionId`:
+//!    - Claude: `~/.claude/sessions/<pid>.json`
+//!    - Codex:  `~/.codex/sessions/pids/<pid>.json` (per sub-issue #30)
+//!
+//!    We scan the appropriate directory, find the entry whose `sessionId`
+//!    matches the marker UUID, and walk that pid's parent chain in `/proc`
+//!    until we hit a tmux pane's `pane_pid`. That pane determines the
+//!    exact tmux session — even when two sessions share a cwd. This is
+//!    the only routing path that distinguishes e.g. `claude-cr-pts-2`
+//!    (PR author) from `claude-cr-pts-7` (a different session that
+//!    happens to be open in the same repo cwd).
 //!
 //! 2. **Cwd basename** (fallback). When the pid index has no entry —
-//!    older Claude versions didn't write it, or the file was reaped —
-//!    fall back to the historical heuristic: read `cwd` out of the
-//!    UUID's JSONL transcript, take its last path component, build
-//!    `claude-<basename>`, and let [`sessions::pick_session`] pick the
-//!    best prefix match (attached, then newest). This is
-//!    *intentionally* ambiguous when two sessions share a cwd, which is
-//!    the bug tier 1 was added to fix; we keep it only as a
+//!    older agent versions didn't write it, or the file was reaped —
+//!    fall back to the historical heuristic: read the agent's `cwd` out
+//!    of the UUID's session transcript, take its last path component,
+//!    build `<agent-prefix><basename>`, and let [`sessions::pick_session`]
+//!    pick the best prefix match (attached, then newest). The transcript
+//!    layouts differ per agent:
+//!    - Claude: `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, `cwd` is a
+//!      top-level field on early records.
+//!    - Codex:  `~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl`, `cwd`
+//!      sits under `session_meta.payload.cwd` on the first record.
+//!
+//!    This tier is *intentionally* ambiguous when two sessions share a cwd,
+//!    which is the bug tier 1 was added to fix; we keep it only as a
 //!    last-resort safety net.
 //!
-//! Why not /proc/<pid>/fd/*: Claude re-opens the JSONL for every append
-//! rather than holding it open, so scanning file descriptors sees nothing
-//! even while the session is actively writing. The JSONL itself is the
-//! stable artifact for the cwd-basename fallback, and the
-//! `~/.claude/sessions/<pid>.json` index is the stable artifact for the
-//! pid path.
+//! Why not /proc/<pid>/fd/*: agents re-open their transcript for every
+//! append rather than holding it open, so scanning file descriptors sees
+//! nothing even while the session is actively writing. The transcript
+//! itself is the stable artifact for tier 2, and the per-agent pid-index
+//! JSON is the stable artifact for tier 1.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -37,6 +46,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::agent::AgentKind;
 use crate::{sessions, tmux};
 
 /// Resolve `uuid` to the tmux session name that authored the PR/issue
@@ -85,7 +95,7 @@ fn resolve_via_pid_index(uuid: &str) -> Result<Option<String>> {
         // Don't trust the entry; fall through to the cwd fallback.
         return Ok(None);
     }
-    let panes = list_claude_panes()?;
+    let panes = list_panes_with_prefix(crate::agent::Agent::claude().tmux_prefix)?;
     Ok(tmux_session_for_descendant_pid(pid, &panes))
 }
 
@@ -104,9 +114,9 @@ fn resolve_via_cwd_basename(uuid: &str) -> Result<Option<String>> {
     let Some(bare) = cwd.file_name().and_then(|s| s.to_str()) else {
         return Ok(None);
     };
-    // This entire resolver path is Claude-specific (the JSONL it reads above
-    // lives under `~/.claude/projects/`), so the agent is fixed. Sub-issue
-    // #27 adds the parallel Codex resolver against `~/.codex/sessions/`.
+    // This resolver path reads JSONL from `~/.claude/projects/`, so the
+    // target session is always Claude. The Codex-parallel resolver lives
+    // in [`resolve_codex_via_cwd_basename`].
     let base = tmux::session_name_for_repo(bare, crate::agent::Agent::claude());
     let sessions = sessions::list_agent_sessions_full()?;
     Ok(sessions::pick_session(&sessions, &base))
@@ -170,24 +180,24 @@ fn proc_is_claude(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// One `claude-*` tmux pane as reported by `tmux list-panes -a`.
+/// One agent-owned tmux pane as reported by `tmux list-panes -a`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneInfo {
     session_name: String,
     /// `#{pane_pid}` — the pid of the first process tmux ran in this
-    /// pane (typically the user's shell). Claude ends up as a
-    /// descendant of this pid, which is what makes the parent-chain
-    /// walk work.
+    /// pane (typically the user's shell). The agent (Claude or Codex)
+    /// ends up as a descendant of this pid, which is what makes the
+    /// parent-chain walk work.
     pane_pid: u32,
 }
 
-/// Enumerate every `claude-*` pane in the tmux server. Returns an
-/// empty vec in either soft-fail case — tmux binary not on PATH, or
-/// tmux server not running — so the resolver falls through to the
-/// cwd fallback rather than failing the webhook. Real failures (e.g.
-/// a regression in the `-F` format string on older tmux) still
+/// Enumerate every tmux pane whose session name starts with `prefix`.
+/// Returns an empty vec in either soft-fail case — tmux binary not on
+/// PATH, or tmux server not running — so the resolver falls through to
+/// the cwd fallback rather than failing the webhook. Real failures
+/// (e.g. a regression in the `-F` format string on older tmux) still
 /// propagate as `Err`.
-fn list_claude_panes() -> Result<Vec<PaneInfo>> {
+fn list_panes_with_prefix(prefix: &str) -> Result<Vec<PaneInfo>> {
     let out = match Command::new("tmux")
         .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"])
         .output()
@@ -209,17 +219,21 @@ fn list_claude_panes() -> Result<Vec<PaneInfo>> {
             stderr.trim()
         ));
     }
-    Ok(parse_pane_list(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_pane_list(
+        &String::from_utf8_lossy(&out.stdout),
+        prefix,
+    ))
 }
 
 /// Pure parser for `tmux list-panes -a -F "#{session_name}\t#{pane_pid}"`.
-/// Skips non-`claude-*` panes and unparseable lines.
-fn parse_pane_list(s: &str) -> Vec<PaneInfo> {
+/// Skips panes whose session name doesn't start with `prefix` and any
+/// lines that don't parse.
+fn parse_pane_list(s: &str, prefix: &str) -> Vec<PaneInfo> {
     s.lines()
         .filter_map(|line| {
             let mut it = line.split('\t');
             let session_name = it.next()?.trim().to_string();
-            if !session_name.starts_with("claude-") {
+            if !session_name.starts_with(prefix) {
                 return None;
             }
             let pane_pid = it.next()?.trim().parse::<u32>().ok()?;
@@ -325,6 +339,224 @@ fn projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+// ---- Codex resolvers ------------------------------------------------------
+//
+// Parallel to the Claude resolvers above, but reads the different on-disk
+// layout: `~/.codex/sessions/pids/<pid>.json` for tier 1 (written by the
+// `codex()` bash wrapper per sub-issue #30; this resolver gracefully
+// returns None until that lands), and
+// `~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl` for tier 2 (always
+// present once a Codex session has produced its first rollout).
+
+/// Codex counterpart of [`resolve_via_pid_index`]. Returns `Ok(None)` when
+/// the pid index directory doesn't exist yet (the common case until
+/// sub-issue #30 lands the bash-wrapper writer), or when the entry is
+/// missing / stale, so the caller falls through to tier 2.
+fn resolve_codex_via_pid_index(uuid: &str) -> Result<Option<String>> {
+    let Some(pid) = codex_pid_for_session_uuid(uuid)? else {
+        return Ok(None);
+    };
+    if !proc_is_codex(pid) {
+        return Ok(None);
+    }
+    let panes = list_panes_with_prefix(crate::agent::Agent::codex().tmux_prefix)?;
+    Ok(tmux_session_for_descendant_pid(pid, &panes))
+}
+
+/// Codex counterpart of [`resolve_via_cwd_basename`]. Reads `cwd` from the
+/// rollout JSONL's `session_meta` payload and picks the best
+/// `codex-<basename>` match.
+fn resolve_codex_via_cwd_basename(uuid: &str) -> Result<Option<String>> {
+    let Some(cwd) = cwd_for_codex_uuid(uuid)? else {
+        return Ok(None);
+    };
+    let Some(bare) = cwd.file_name().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let base = tmux::session_name_for_repo(bare, crate::agent::Agent::codex());
+    let sessions = sessions::list_agent_sessions_full()?;
+    Ok(sessions::pick_session(&sessions, &base))
+}
+
+/// Scan `~/.codex/sessions/pids/*.json` and return the pid recorded for
+/// the entry whose `sessionId` matches `uuid`, if any. Same on-disk shape
+/// as Claude's `<pid>.json`, so the existing pure parser
+/// [`pid_from_session_json`] is reused verbatim.
+fn codex_pid_for_session_uuid(uuid: &str) -> Result<Option<u32>> {
+    let dir_path = codex_pid_state_dir()?;
+    let dir = match fs::read_dir(&dir_path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir_path.display())),
+    };
+    for entry in dir {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(pid) = pid_from_session_json(&text, uuid) {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+/// True when `/proc/<pid>/comm` reads exactly `codex`.
+fn proc_is_codex(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim() == "codex")
+        .unwrap_or(false)
+}
+
+/// Locate the Codex rollout JSONL whose filename ends with `-<uuid>.jsonl`
+/// inside `~/.codex/sessions/YYYY/MM/DD/`, and read the session's `cwd`
+/// from its `session_meta` payload. Returns `Ok(None)` when the file
+/// doesn't exist on this host (session was on a different machine, or
+/// the rollout dir was rotated away).
+fn cwd_for_codex_uuid(uuid: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = find_codex_rollout_for_uuid(uuid)? else {
+        return Ok(None);
+    };
+    read_cwd_from_codex_jsonl(&path)
+}
+
+/// Recursive (year/month/day = 3-deep) scan of `~/.codex/sessions` for a
+/// file whose name ends with `-<uuid>.jsonl`. The Codex rollout filename
+/// embeds both the start timestamp and the UUID, so a UUID alone doesn't
+/// tell us the date — we have to walk. The directory tree is shallow and
+/// pruned by the per-day partitioning, so this is acceptably fast in
+/// practice (low thousands of files per year of history). Bounded to 3
+/// levels of nesting to keep an unexpected layout change (or a symlink
+/// loop) from chewing CPU.
+fn find_codex_rollout_for_uuid(uuid: &str) -> Result<Option<PathBuf>> {
+    let root = codex_sessions_dir()?;
+    let needle = format!("-{uuid}.jsonl");
+    walk_for_suffix(&root, &needle, 3)
+}
+
+/// Generic bounded-depth filesystem walker. Skips entries that error out
+/// (e.g. permission denied on a stray file) rather than aborting the
+/// whole scan — the goal is best-effort resolution, not strict
+/// validation of the directory tree.
+fn walk_for_suffix(root: &Path, suffix: &str, max_depth: usize) -> Result<Option<PathBuf>> {
+    let dir = match fs::read_dir(root) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", root.display())),
+    };
+    for entry in dir {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(ftype) = entry.file_type() else {
+            continue;
+        };
+        if ftype.is_file() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.ends_with(suffix) {
+                    return Ok(Some(path));
+                }
+            }
+        } else if ftype.is_dir() && max_depth > 0 {
+            if let Some(hit) = walk_for_suffix(&path, suffix, max_depth - 1)? {
+                return Ok(Some(hit));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Read the first record of a Codex rollout JSONL and extract
+/// `payload.cwd` from the `session_meta` event. The Codex rollout
+/// schema puts the session metadata as the very first line; we still
+/// scan up to 5 lines as a safety net in case a future schema change
+/// reorders.
+fn read_cwd_from_codex_jsonl(path: &Path) -> Result<Option<PathBuf>> {
+    const MAX_LINES: usize = 5;
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    for (i, line) in reader.lines().enumerate() {
+        if i >= MAX_LINES {
+            break;
+        }
+        let Ok(line) = line else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        // Codex schema: top-level `type == "session_meta"`, the cwd lives
+        // under `payload.cwd`. The check on `type` keeps us from
+        // accidentally matching a future event variant that reuses the
+        // word `cwd` somewhere else in its payload.
+        if v.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        if let Some(cwd) = v
+            .pointer("/payload/cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(Some(PathBuf::from(cwd)));
+        }
+    }
+    Ok(None)
+}
+
+/// `$HOME/.codex/sessions/pids`. The pid-index location is documented by
+/// sub-issue #30; the resolver here exists in advance so the writer side
+/// can drop files in without further code changes on this end.
+fn codex_pid_state_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("no home directory")?;
+    Ok(home.join(".codex").join("sessions").join("pids"))
+}
+
+/// `$HOME/.codex/sessions`. Root of the YYYY/MM/DD rollout tree we walk
+/// to recover a UUID's `cwd`. Split out for the same reason as
+/// [`projects_dir`] — keeps tests injectable at the parser layer.
+fn codex_sessions_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("no home directory")?;
+    Ok(home.join(".codex").join("sessions"))
+}
+
+// ---- Public agent-aware dispatch -----------------------------------------
+
+/// Resolve a session UUID for the given agent. Two-tier strategy
+/// (pid index → cwd-basename fallback), choosing the per-agent paths
+/// internally. This is the API new callers should use; the existing
+/// Claude-only [`resolve_tmux_session`] / [`resolve_tmux_session_strict`]
+/// remain as thin shims and will be migrated to call this in sub-issue
+/// #29.
+#[allow(dead_code)]
+pub fn resolve_tmux_session_for_marker(uuid: &str, kind: AgentKind) -> Result<Option<String>> {
+    match kind {
+        AgentKind::Claude => resolve_tmux_session(uuid),
+        AgentKind::Codex => {
+            if let Some(name) = resolve_codex_via_pid_index(uuid)? {
+                return Ok(Some(name));
+            }
+            resolve_codex_via_cwd_basename(uuid)
+        }
+    }
+}
+
+/// Strict variant of [`resolve_tmux_session_for_marker`] — tier 1 only,
+/// never the cwd fallback. Use this when the caller has hard knowledge
+/// of which session should receive the wake (e.g. `ghnotify send
+/// --commit <SHA>`); tier 2 would be silent-misroute territory in that
+/// context.
+#[allow(dead_code)]
+pub fn resolve_tmux_session_for_marker_strict(
+    uuid: &str,
+    kind: AgentKind,
+) -> Result<Option<String>> {
+    match kind {
+        AgentKind::Claude => resolve_tmux_session_strict(uuid),
+        AgentKind::Codex => resolve_codex_via_pid_index(uuid),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +643,115 @@ mod tests {
         );
     }
 
+    // -- codex JSONL parser ----------------------------------------------
+
+    #[test]
+    fn codex_jsonl_reads_payload_cwd_from_session_meta() {
+        // Real-world shape: first record is `session_meta`, `cwd` sits
+        // under `payload.cwd`. This is the load-bearing test for the
+        // Codex tier-2 path.
+        let tmp = tempdir();
+        let path = write_jsonl(
+            &tmp,
+            &[
+                r#"{"timestamp":"2026-05-20T11:37:42.417Z","type":"session_meta","payload":{"id":"019e452d-3bbd-7453-ae8f-5587f7749fb0","cwd":"/home/jirka/Olbrasoft/ghnotify"}}"#,
+                r#"{"timestamp":"2026-05-20T11:37:50.000Z","type":"user_input"}"#,
+            ],
+        );
+        assert_eq!(
+            read_cwd_from_codex_jsonl(&path).unwrap(),
+            Some(PathBuf::from("/home/jirka/Olbrasoft/ghnotify"))
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_ignores_non_session_meta_events_with_cwd_field() {
+        // Future Codex versions might emit other event types that happen
+        // to carry a `payload.cwd` (e.g. a shell command record). Those
+        // are NOT the session's canonical cwd; the resolver must look
+        // only at `session_meta`. Without the type check we'd silently
+        // mis-route to whatever the most recent command's working
+        // directory was.
+        let tmp = tempdir();
+        let path = write_jsonl(
+            &tmp,
+            &[
+                r#"{"type":"shell_call","payload":{"cwd":"/tmp/some-subdir"}}"#,
+                r#"{"type":"session_meta","payload":{"id":"x","cwd":"/home/jirka/cr"}}"#,
+            ],
+        );
+        assert_eq!(
+            read_cwd_from_codex_jsonl(&path).unwrap(),
+            Some(PathBuf::from("/home/jirka/cr"))
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_ignores_empty_payload_cwd() {
+        // Mirror of the Claude `ignores_empty_cwd` test for the Codex
+        // shape. An empty string must not be returned as a valid cwd.
+        let tmp = tempdir();
+        let path = write_jsonl(
+            &tmp,
+            &[
+                r#"{"type":"session_meta","payload":{"cwd":""}}"#,
+                r#"{"type":"session_meta","payload":{"cwd":"/home/jirka/imdb"}}"#,
+            ],
+        );
+        assert_eq!(
+            read_cwd_from_codex_jsonl(&path).unwrap(),
+            Some(PathBuf::from("/home/jirka/imdb"))
+        );
+    }
+
+    // -- rollout walker --------------------------------------------------
+
+    #[test]
+    fn walk_for_suffix_finds_file_nested_three_deep() {
+        // Models the actual `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+        // layout. The walker must traverse three directory levels and
+        // match by filename suffix.
+        let root = tempdir();
+        let nested = root.join("2026").join("05").join("20");
+        fs::create_dir_all(&nested).unwrap();
+        let target = nested.join("rollout-2026-05-20T13-37-32-abc-uuid.jsonl");
+        fs::write(&target, "").unwrap();
+        // Decoy files at various depths that should NOT match.
+        fs::write(root.join("README"), "").unwrap();
+        fs::write(nested.join("rollout-2026-05-20T01-other.jsonl"), "").unwrap();
+
+        let found = walk_for_suffix(&root, "-abc-uuid.jsonl", 3).unwrap();
+        assert_eq!(found, Some(target));
+    }
+
+    #[test]
+    fn walk_for_suffix_respects_max_depth() {
+        // A file deeper than the depth budget must not be found. Without
+        // this guard, an unexpected layout change or a symlink loop
+        // could chew CPU walking arbitrarily deep.
+        let root = tempdir();
+        let deep = root.join("a").join("b").join("c").join("d").join("e");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("hit-uuid.jsonl"), "").unwrap();
+
+        // max_depth = 3 means we traverse root → a → b → c, but not
+        // deeper. The hit lives 5 levels down.
+        assert_eq!(walk_for_suffix(&root, "-uuid.jsonl", 3).unwrap(), None);
+    }
+
+    #[test]
+    fn walk_for_suffix_returns_none_when_root_missing() {
+        // Tier-1 callers always probe even when the directory tree
+        // doesn't exist yet (e.g. before sub-issue #30's bash wrapper
+        // has written any pid files). Missing root must not error.
+        let missing = std::env::temp_dir().join(format!(
+            "ghnotify-test-missing-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        assert_eq!(walk_for_suffix(&missing, ".jsonl", 3).unwrap(), None);
+    }
+
     /// Throwaway tempdir helper — avoids pulling in `tempfile` just for
     /// two tests. Uses the PID to avoid collision between parallel test
     /// runs.
@@ -482,14 +823,37 @@ mod tests {
         let input = "\
 claude-cr-pts-2\t11209
 claude-cr-pts-7\t544135
+codex-cr-pts-3\t11500
 other-session\t99999
 ";
-        let got = parse_pane_list(input);
-        assert_eq!(got.len(), 2, "non-claude panes must be filtered out");
+        let got = parse_pane_list(input, "claude-");
+        assert_eq!(
+            got.len(),
+            2,
+            "non-claude panes (including codex-*) must be filtered out"
+        );
         assert_eq!(got[0].session_name, "claude-cr-pts-2");
         assert_eq!(got[0].pane_pid, 11209);
         assert_eq!(got[1].session_name, "claude-cr-pts-7");
         assert_eq!(got[1].pane_pid, 544135);
+    }
+
+    #[test]
+    fn parse_pane_list_filters_to_codex_sessions() {
+        // Codex-prefix variant of the filter test. Same parser, different
+        // prefix — both agents are first-class.
+        let input = "\
+claude-cr-pts-2\t11209
+codex-ghnotify-pts-7\t544135
+codex-cr-pts-3\t11500
+other-session\t99999
+";
+        let got = parse_pane_list(input, "codex-");
+        assert_eq!(got.len(), 2, "only codex-* panes must survive");
+        assert_eq!(got[0].session_name, "codex-ghnotify-pts-7");
+        assert_eq!(got[0].pane_pid, 544135);
+        assert_eq!(got[1].session_name, "codex-cr-pts-3");
+        assert_eq!(got[1].pane_pid, 11500);
     }
 
     #[test]
@@ -501,7 +865,7 @@ claude-only-name
 \t12345
 claude-good\t777
 ";
-        let got = parse_pane_list(input);
+        let got = parse_pane_list(input, "claude-");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].session_name, "claude-good");
         assert_eq!(got[0].pane_pid, 777);
