@@ -263,7 +263,12 @@ async fn process_webhook(
     // 4. Resolve target session. UUID-based first (correct across repos),
     //    repo-prefix fallback (legacy behavior for events we can't
     //    attribute to a specific author session).
-    let base = tmux::session_name_for_repo(repo_name);
+    //
+    // The `base` here is used only for the "not found" log message below;
+    // it shows the Claude name shape the user would expect to see. Sub-issue
+    // #29 makes this log line agent-aware (it currently still names just
+    // `claude-…` in the not-found message).
+    let base = tmux::session_name_for_repo(repo_name, crate::agent::Agent::claude());
     let (session, via) = match resolve_target_session(event_type, &payload, repo_name).await {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
@@ -360,7 +365,14 @@ async fn resolve_target_session(
     // C — repo-prefix fallback. Preserves legacy behavior for events
     // without a marker (ping, issues assigned, issue_comment on non-PR
     // issues) and as a safety net when the author session is dead.
-    match sessions::resolve_session_for_repo(repo_name)? {
+    //
+    // Agent-agnostic resolution: when no marker is available, consider
+    // every agent's sessions for the repo and let recency decide which one
+    // wins. With Claude-only setups this is functionally identical to the
+    // pre-refactor behavior (only Claude sessions exist, so they win
+    // trivially); with Codex sessions present, the most-recently-active
+    // session is preferred regardless of agent.
+    match sessions::resolve_session_for_repo_any(repo_name)? {
         Some(name) => Ok(Some((name, "repo"))),
         None => Ok(None),
     }
