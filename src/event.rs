@@ -136,9 +136,11 @@ fn is_likely_default_branch(head_branch: &str) -> bool {
 /// Two trigger shapes per agent (defined in `agent::Agent::mention_triggers`):
 ///   * `@`-mentions match anywhere in the body via `contains`
 ///     (`@claude`, `@claude-cr`, `@codex`, `@codex-cr`).
-///   * `/`-slash triggers match only at the start of a (whitespace-stripped)
-///     line so a casual mention of `/claude` inside prose doesn't fire
-///     (`/claude`, `/codex`).
+///   * `/`-slash triggers match when the first whitespace-separated token
+///     of a line equals the trigger exactly (`/claude`, `/codex`). The
+///     exact-token rule keeps `/claude-cr` from satisfying `/claude` —
+///     different verbs must not collide — and also keeps a casual mention
+///     of `/claude` mid-sentence in prose from firing the wake.
 ///
 /// This stage is intentionally agent-permissive: a `@codex` mention on a
 /// Claude-only repo still forwards from classify, and the agent-target
@@ -148,17 +150,18 @@ fn is_likely_default_branch(head_branch: &str) -> bool {
 fn mentions_any_agent(body: &str) -> bool {
     for agent in crate::agent::Agent::all() {
         for trigger in agent.mention_triggers {
-            if let Some(rest) = trigger.strip_prefix('/') {
-                // Slash trigger — line-start match. `rest` is the verb
-                // without the leading `/`, but we want the full `/verb`
-                // string for the prefix check so a username starting with
-                // the verb can't trip it (e.g. `claude-cr` shouldn't
-                // satisfy `/claude`).
-                let full = format!("/{rest}");
-                if body
-                    .lines()
-                    .any(|l| l.trim_start().starts_with(full.as_str()))
-                {
+            if trigger.starts_with('/') {
+                // Slash trigger — first whitespace-separated token of a
+                // line must equal the trigger exactly. The exact-match
+                // matters: a `starts_with("/claude")` would also accept
+                // `/claude-cr ...` (a different verb), silently
+                // misclassifying as a Claude trigger.
+                if body.lines().any(|l| {
+                    l.trim_start()
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|tok| tok == *trigger)
+                }) {
                     return true;
                 }
             } else if body.contains(trigger) {
@@ -448,8 +451,10 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .unwrap_or("");
             // Wake only when the comment explicitly addresses an agent —
             // an `@`-mention anywhere in the body, or a `/`-slash trigger
-            // on its own line. Otherwise normal issue chat would wake the
-            // session every few seconds on busy repos.
+            // as the first token of a line (arguments on the same line
+            // are fine: `/claude please do X` triggers). Otherwise normal
+            // issue chat would wake the session every few seconds on
+            // busy repos.
             //
             // Triggers come from every registered agent's `mention_triggers`
             // list (`@claude`, `@claude-cr`, `/claude` for Claude;
@@ -1534,6 +1539,23 @@ mod tests {
         // repos.
         assert!(!mentions_any_agent("Just a regular comment, no mentions."));
         assert!(!mentions_any_agent(""));
+    }
+
+    #[test]
+    fn mentions_any_agent_does_not_confuse_distinct_slash_verbs() {
+        // Word-boundary regression guard: a starts_with-only check would
+        // match `/claude-cr ...` against `/claude` and quietly forward.
+        // Different slash verbs are different commands — `/claude-cr`
+        // must not satisfy `/claude`, and vice versa.
+        //
+        // Neither `/claude-cr` nor `/codex-cr` is in the current
+        // mention_triggers list (the `-cr` suffix exists only on the
+        // `@`-mentions), so a line whose first token is `/claude-cr`
+        // must NOT satisfy `/claude`.
+        assert!(!mentions_any_agent("/claude-cr please review"));
+        assert!(!mentions_any_agent("/codex-cr take a look"));
+        // The bare `/claude` (with or without args after) still works.
+        assert!(mentions_any_agent("/claude please review"));
     }
 
     // ---- compute_ci_aggregate ----
