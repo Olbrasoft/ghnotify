@@ -20,15 +20,18 @@
 //!   1. **By author UUID from the payload** — `pull_request`,
 //!      `pull_request_review`, `pull_request_review_comment` and
 //!      `issue_comment` payloads carry the PR/issue body inline.
-//!      Extract `<!-- claude-session: UUID -->` (embedded by `gh pr
-//!      create` per the global CLAUDE.md convention) and route the
-//!      wake to the session that authored the PR, regardless of the
-//!      event's repo. This is the *only* correct answer when a session
-//!      runs in one directory but opens PRs in another (e.g. imdb
-//!      session → cr PR).
+//!      Extract `<!-- claude-session: UUID -->` or
+//!      `<!-- codex-session: UUID -->` (embedded by each agent's
+//!      `gh pr create` convention). The marker also carries which
+//!      agent it belongs to, so the UUID resolver dispatches to the
+//!      matching agent's on-disk layout (`~/.claude/...` vs
+//!      `~/.codex/...`). Route the wake to the session that authored
+//!      the PR, regardless of the event's repo. This is the *only*
+//!      correct answer when a session runs in one directory but opens
+//!      PRs in another (e.g. imdb session → cr PR).
 //!   2. **By author UUID via `gh api`** — `check_suite` payloads
 //!      don't carry PR bodies, so we resolve them via `gh`. See
-//!      [`uuid_from_check_suite`] for the three payload shapes
+//!      [`marker_from_check_suite`] for the three payload shapes
 //!      covered (branch-named, synthetic-ref, post-merge default-
 //!      branch via commit → PR lookup). Without the commit-lookup
 //!      path, post-merge `ci-success branch=main pr=none` wakes fell
@@ -46,6 +49,15 @@
 //!      behavior for non-PR events (`ping`, `issues assigned`) and for
 //!      PRs created before the marker convention existed.
 //!
+//! Post-resolution agent filter (issue_comment only): once a session is
+//! resolved, an `issue_comment` event is dropped when the comment body
+//! doesn't address the resolved session's agent. This catches the case
+//! where a comment with only `@codex please review` lands on a repo with
+//! only a Claude session — the wake would otherwise reach Claude even
+//! though the comment wasn't for it. Classify itself is intentionally
+//! agent-permissive (it has no session-resolution context), so the
+//! agent-target filter lives here in the webhook handler.
+//!
 //! Runs in two modes:
 //!   * persistent — binds an address and serves forever (`ghnotify serve`)
 //!   * one-shot   — serves exactly one request then exits (`ghnotify serve --one-shot`),
@@ -53,7 +65,9 @@
 //!     nothing is running between webhook deliveries.
 
 use crate::{
-    agent::Agent, config::Config, event, gh_lookup, session_by_uuid, session_marker, sessions, tmux,
+    agent::{Agent, AgentKind},
+    config::Config,
+    event, gh_lookup, session_by_uuid, session_marker, sessions, tmux,
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -307,9 +321,49 @@ async fn process_webhook(
             );
         }
     };
+
+    // Resolved agent — derived once from the session name's prefix and
+    // reused for both the strict issue_comment filter immediately below
+    // and the delivery log further down. Re-deriving in two spots
+    // would risk the log and the filter going out of sync if either
+    // call site is ever changed.
+    let resolved_agent = Agent::from_tmux_session_name(&session);
+
+    // 4a. Strict agent-mention filter for issue_comment events.
+    //     `event::classify` is agent-permissive (it forwards any agent's
+    //     trigger), so a comment with only `@codex please review` makes
+    //     it this far even when the resolved session is Claude. Without
+    //     this filter the wake would land in Claude — which is the
+    //     misroute issue #28's acceptance criterion calls out. Drop now
+    //     when the comment doesn't address the resolved session's
+    //     agent.
+    if issue_comment_mismatches_agent(event_type, &payload, resolved_agent) {
+        info!(
+            session,
+            via,
+            event_type,
+            agent_kind = ?resolved_agent.map(|a| a.kind),
+            "issue_comment does not address the resolved session's agent, event discarded"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "discarded": true,
+                "reason": "comment trigger does not match resolved session's agent",
+                "session": session,
+                "via": via,
+            })),
+        );
+    }
+
+    // The resolved session's agent kind is included in the delivery log
+    // so an operator scanning the journal can tell at a glance whether
+    // a wake landed in Claude or Codex.
+    let agent_kind = resolved_agent.map(|a| a.kind);
     match tmux::send_prompt(&session, &prompt) {
         Ok(tmux::Delivery::Delivered) => {
-            info!(session, via, event_type, "prompt delivered");
+            info!(session, via, event_type, agent_kind = ?agent_kind, "prompt delivered");
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "session": session, "via": via })),
@@ -355,9 +409,12 @@ async fn resolve_target_session(
 ) -> Result<Option<(String, &'static str)>> {
     // A — UUID embedded directly in the webhook payload. Covers
     // pull_request, pull_request_review, pull_request_review_comment
-    // and issue_comment (on PRs).
-    if let Some(uuid) = uuid_from_payload(event_type, payload) {
-        if let Some(name) = try_resolve_uuid(&uuid, event_type, "payload") {
+    // and issue_comment (on PRs). The marker carries its own agent
+    // kind (claude-session vs codex-session), and `try_resolve_uuid`
+    // routes to the matching resolver — sending a Codex UUID into
+    // Claude's `~/.claude/...` paths would always miss.
+    if let Some((uuid, kind)) = marker_from_payload(event_type, payload) {
+        if let Some(name) = try_resolve_uuid(&uuid, kind, event_type, "payload") {
             return Ok(Some((name, "uuid")));
         }
     }
@@ -367,8 +424,8 @@ async fn resolve_target_session(
     // CI wakes, which the user expects to land on whoever pushed the
     // commit (not on "whichever session happens to have this repo open").
     if event_type == "check_suite" {
-        if let Some(uuid) = uuid_from_check_suite(payload).await {
-            if let Some(name) = try_resolve_uuid(&uuid, event_type, "check_suite/gh") {
+        if let Some((uuid, kind)) = marker_from_check_suite(payload).await {
+            if let Some(name) = try_resolve_uuid(&uuid, kind, event_type, "check_suite/gh") {
                 return Ok(Some((name, "uuid")));
             }
         }
@@ -392,10 +449,39 @@ async fn resolve_target_session(
     }
 }
 
-/// Extract the claude-session marker from fields directly present in the
-/// webhook payload. Returns `None` for event types whose payloads don't
-/// carry a PR/issue body, or when no marker is present in the body.
-fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
+/// Decide whether an issue_comment event should be discarded because
+/// its comment body doesn't address the resolved session's agent.
+///
+/// Pure function of (event_type, payload, resolved_agent) so the
+/// discard policy is unit-testable without spinning up the axum
+/// handler. Returns `false` for any non-`issue_comment` event (the
+/// rule only applies to comments) and for the unusual case where the
+/// resolved session name doesn't match any known agent prefix (can't
+/// decide → don't drop).
+fn issue_comment_mismatches_agent(
+    event_type: &str,
+    payload: &Value,
+    resolved_agent: Option<&'static Agent>,
+) -> bool {
+    if event_type != "issue_comment" {
+        return false;
+    }
+    let Some(agent) = resolved_agent else {
+        return false;
+    };
+    let body = payload
+        .pointer("/comment/body")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    !event::body_addresses_agent(body, agent)
+}
+
+/// Extract the agent-session marker from fields directly present in the
+/// webhook payload. Returns `(uuid, kind)` so the caller can dispatch the
+/// UUID resolver to the agent that actually owns the marker. Returns
+/// `None` for event types whose payloads don't carry a PR/issue body, or
+/// when no agent marker is present in the body.
+fn marker_from_payload(event_type: &str, payload: &Value) -> Option<(String, AgentKind)> {
     let body = match event_type {
         // `pull_request` events carry the PR body at /pull_request/body.
         // `pull_request_review` and `pull_request_review_comment` also
@@ -405,16 +491,13 @@ fn uuid_from_payload(event_type: &str, payload: &Value) -> Option<String> {
         }
         // issue_comment on a PR has `issue.pull_request` set and
         // `issue.body` carries the PR body. For non-PR issues, the body
-        // is just the issue body (very rarely has a claude-session
-        // marker), but trying is harmless.
+        // is just the issue body (very rarely has a marker), but trying
+        // is harmless.
         "issue_comment" => payload.pointer("/issue/body"),
         _ => None,
     }?
     .as_str()?;
-    // Claude-tag only for now; sub-issue #29 swaps this for
-    // `session_marker::extract_marker(body)` and dispatches on the
-    // returned AgentKind to pick the right resolver downstream.
-    session_marker::extract_uuid(body, crate::agent::Agent::claude().pr_marker_tag)
+    session_marker::extract_marker(body)
 }
 
 /// Outcome of aggregate-refining a `check_suite` wake.
@@ -718,7 +801,7 @@ fn pr_number_from_head_branch(payload: &Value) -> Option<u64> {
 /// mode emits a warning so UUID-routing regressions are diagnosable
 /// from the journal; silent `None`s used to hide "gh not on PATH"
 /// behind a generic repo-routing fallback.
-async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
+async fn marker_from_check_suite(payload: &Value) -> Option<(String, AgentKind)> {
     let full_name = payload
         .pointer("/repository/full_name")
         .and_then(Value::as_str)?;
@@ -728,10 +811,7 @@ async fn uuid_from_check_suite(payload: &Value) -> Option<String> {
             gh_lookup::fetch_pr_body_by_commit(full_name, &sha).await?
         }
     };
-    // Claude-tag only for now; sub-issue #29 swaps this for
-    // `session_marker::extract_marker(&body)` so check_suite wakes can
-    // also route into Codex sessions when the PR was authored by Codex.
-    session_marker::extract_uuid(&body, crate::agent::Agent::claude().pr_marker_tag)
+    session_marker::extract_marker(&body)
 }
 
 /// Which gh-API endpoint is usable for extracting the PR body from a
@@ -771,20 +851,28 @@ fn check_suite_lookup_strategy(payload: &Value) -> Option<CheckSuiteLookup> {
     Some(CheckSuiteLookup::ByCommit(sha))
 }
 
-/// Run `session_by_uuid::resolve_tmux_session`, log both the UUID-
-/// found-but-session-dead case and the JSONL/tmux lookup failure case,
-/// and return the tmux session name (if any) for the caller to use.
-fn try_resolve_uuid(uuid: &str, event_type: &str, origin: &str) -> Option<String> {
-    match session_by_uuid::resolve_tmux_session(uuid) {
+/// Run `session_by_uuid::resolve_tmux_session_for_marker(uuid, kind)`, log
+/// both the UUID-found-but-session-dead case and the JSONL/tmux lookup
+/// failure case, and return the tmux session name (if any) for the caller.
+///
+/// The `kind` argument is determined upstream from which agent's marker
+/// tag actually appeared in the PR body — so we route a `claude-session`
+/// UUID into Claude's `~/.claude/...` paths and a `codex-session` UUID
+/// into Codex's `~/.codex/...` paths. Sending the wrong UUID to the
+/// wrong agent's resolver would always miss (different on-disk layouts).
+fn try_resolve_uuid(uuid: &str, kind: AgentKind, event_type: &str, origin: &str) -> Option<String> {
+    match session_by_uuid::resolve_tmux_session_for_marker(uuid, kind) {
         Ok(Some(name)) => Some(name),
         Ok(None) => {
             // `Ok(None)` lumps several miss reasons together: UUID has
-            // no on-disk JSONL (session unknown to this host), JSONL
-            // exists but has no cwd record, or the cwd's tmux session
-            // is not live. All of them mean "author session not here" —
-            // fall back to repo routing rather than discard.
+            // no on-disk transcript (session unknown to this host),
+            // transcript exists but has no cwd record, or the cwd's
+            // tmux session is not live. All of them mean "author
+            // session not here" — fall back to repo routing rather
+            // than discard.
             warn!(
                 uuid,
+                kind = ?kind,
                 origin,
                 event_type,
                 "author session not resolvable (jsonl/cwd/tmux miss); falling back to repo routing"
@@ -795,7 +883,14 @@ fn try_resolve_uuid(uuid: &str, event_type: &str, origin: &str) -> Option<String
             // I/O or tmux failure in the JSONL/pane lookup. Surfaced
             // so a broken home directory or tmux regression doesn't
             // silently revert every wake to repo routing.
-            warn!(error = %e, uuid, origin, event_type, "UUID resolve failed; falling back to repo routing");
+            warn!(
+                error = %e,
+                uuid,
+                kind = ?kind,
+                origin,
+                event_type,
+                "UUID resolve failed; falling back to repo routing"
+            );
             None
         }
     }
@@ -1073,5 +1168,96 @@ mod tests {
         );
         let just_below = entry("queued", None, 0, STUCK_QUEUED_AGE_THRESHOLD_S - 0.1);
         assert!(!just_below.is_stuck_queued());
+    }
+
+    // ---- issue_comment_mismatches_agent ----
+
+    fn comment_payload(body: &str) -> Value {
+        json!({
+            "action": "created",
+            "comment": { "body": body, "user": { "login": "alice" } },
+            "issue": { "number": 5 },
+        })
+    }
+
+    #[test]
+    fn issue_comment_mismatches_when_codex_comment_resolves_to_claude() {
+        // The core scenario issue #28's strict acceptance criterion calls
+        // out: a `@codex` comment must NOT wake a Claude session. The
+        // strict filter discards.
+        let payload = comment_payload("Hey @codex please review");
+        assert!(issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::claude())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_matches_when_codex_comment_resolves_to_codex() {
+        // Same payload, but the resolved session is the agent the
+        // comment actually addressed — wake forwards.
+        let payload = comment_payload("Hey @codex please review");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::codex())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_mismatches_when_claude_comment_resolves_to_codex() {
+        // Symmetric: a Claude-only mention must NOT wake Codex.
+        let payload = comment_payload("@claude-cr take a look");
+        assert!(issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::codex())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_matches_when_claude_comment_resolves_to_claude() {
+        let payload = comment_payload("/claude do the thing");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            Some(Agent::claude())
+        ));
+    }
+
+    #[test]
+    fn issue_comment_mismatch_rule_does_not_apply_to_other_event_types() {
+        // The strict filter is scoped to issue_comment only. CI wakes,
+        // PR-review wakes, etc. don't have an addresses-an-agent
+        // concept — they fire because of the event itself, not because
+        // someone typed a trigger. The filter must not affect them.
+        let payload = comment_payload("@codex please review");
+        for evt in [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "check_suite",
+            "ping",
+        ] {
+            assert!(
+                !issue_comment_mismatches_agent(evt, &payload, Some(Agent::claude())),
+                "filter must not apply to event_type={evt}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_comment_mismatch_returns_false_when_resolved_agent_unknown() {
+        // Edge case: the resolved session name doesn't match any known
+        // prefix (shouldn't happen in practice — sessions::pick_session
+        // only returns names that started with an agent prefix — but
+        // documents the cautious "can't decide → don't drop" policy).
+        let payload = comment_payload("@codex please review");
+        assert!(!issue_comment_mismatches_agent(
+            "issue_comment",
+            &payload,
+            None
+        ));
     }
 }

@@ -148,31 +148,51 @@ fn is_likely_default_branch(head_branch: &str) -> bool {
 /// Keeping the two stages decoupled means classify stays a pure function
 /// of the payload and doesn't need session-resolution context.
 fn mentions_any_agent(body: &str) -> bool {
-    for agent in crate::agent::Agent::all() {
-        for trigger in agent.mention_triggers {
-            if trigger.starts_with('/') {
-                // Slash trigger — first whitespace-separated token of a
-                // line must equal the trigger exactly. The exact-match
-                // matters: a `starts_with("/claude")` would also accept
-                // `/claude-cr ...` (a different verb), silently
-                // misclassifying as a Claude trigger.
-                // `split_whitespace` already skips leading whitespace,
-                // so a `trim_start` here would be redundant
-                // (clippy::trim_split_whitespace).
-                if body.lines().any(|l| {
-                    l.split_whitespace()
-                        .next()
-                        .is_some_and(|tok| tok == *trigger)
-                }) {
-                    return true;
-                }
-            } else if body.contains(trigger) {
-                // `@`-mention — substring anywhere in the body.
-                return true;
-            }
-        }
+    crate::agent::Agent::all()
+        .iter()
+        .any(|a| body_addresses_agent(body, a))
+}
+
+/// True when `body` carries a trigger that explicitly addresses *this
+/// specific agent*. Same match modes as [`mentions_any_agent`] but
+/// scoped to one agent's `mention_triggers` list — used after session
+/// resolution to drop a wake whose comment addressed agent A but whose
+/// resolved session belongs to agent B.
+///
+/// This is the strict half of the two-stage filter:
+///   * [`mentions_any_agent`] (in `classify`) — agent-permissive, only
+///     answers "should we even consider this an addressed wake?"
+///   * `body_addresses_agent` (after session resolution) —
+///     agent-strict, answers "does the comment address the agent
+///     whose session we just resolved?"
+///
+/// Without the second stage, a `@codex please review` comment on a
+/// Claude-only repo would wake Claude (the only session that exists),
+/// which is exactly the misroute issue #28's acceptance criterion calls
+/// out. The two stages can't be collapsed into one because classify runs
+/// before session resolution and doesn't know which agent will receive
+/// the wake.
+pub fn body_addresses_agent(body: &str, agent: &crate::agent::Agent) -> bool {
+    agent
+        .mention_triggers
+        .iter()
+        .any(|t| matches_trigger(body, t))
+}
+
+/// Match a single trigger against `body`. Slash-prefixed triggers must
+/// be the first whitespace-separated token of some line (exact match,
+/// so `/claude-cr` does NOT satisfy `/claude`); other triggers
+/// (`@`-mentions) match by substring anywhere.
+///
+/// `split_whitespace` already skips leading whitespace, so no
+/// `trim_start` is needed (clippy::trim_split_whitespace).
+fn matches_trigger(body: &str, trigger: &str) -> bool {
+    if trigger.starts_with('/') {
+        body.lines()
+            .any(|l| l.split_whitespace().next() == Some(trigger))
+    } else {
+        body.contains(trigger)
     }
-    false
 }
 
 /// Concrete next-step instruction appended to the `ci-success` / `ci-failure`
@@ -1541,6 +1561,30 @@ mod tests {
         // repos.
         assert!(!mentions_any_agent("Just a regular comment, no mentions."));
         assert!(!mentions_any_agent(""));
+    }
+
+    #[test]
+    fn body_addresses_agent_only_matches_the_requested_agent() {
+        // The strict half of the two-stage filter: a comment that
+        // addresses Codex (only) must NOT count as addressing Claude,
+        // and vice versa. Without this, `@codex please review` would
+        // forward to a Claude session (the agent-permissive classify
+        // accepts any agent's trigger).
+        let claude = crate::agent::Agent::claude();
+        let codex = crate::agent::Agent::codex();
+
+        assert!(body_addresses_agent("Hey @codex please look", codex));
+        assert!(!body_addresses_agent("Hey @codex please look", claude));
+
+        assert!(body_addresses_agent("@claude-cr take a look", claude));
+        assert!(!body_addresses_agent("@claude-cr take a look", codex));
+
+        assert!(body_addresses_agent("/codex review this", codex));
+        assert!(!body_addresses_agent("/codex review this", claude));
+
+        // Plain prose addresses neither.
+        assert!(!body_addresses_agent("Just chatting", claude));
+        assert!(!body_addresses_agent("Just chatting", codex));
     }
 
     #[test]
