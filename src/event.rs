@@ -156,9 +156,11 @@ fn mentions_any_agent(body: &str) -> bool {
                 // matters: a `starts_with("/claude")` would also accept
                 // `/claude-cr ...` (a different verb), silently
                 // misclassifying as a Claude trigger.
+                // `split_whitespace` already skips leading whitespace,
+                // so a `trim_start` here would be redundant
+                // (clippy::trim_split_whitespace).
                 if body.lines().any(|l| {
-                    l.trim_start()
-                        .split_whitespace()
+                    l.split_whitespace()
                         .next()
                         .is_some_and(|tok| tok == *trigger)
                 }) {
