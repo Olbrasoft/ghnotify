@@ -47,7 +47,8 @@ Claude's: tmux session names start with `codex-`, PR bodies carry a
 alongside tier-2 (cwd-basename) fallback.
 
 `ghnotify install` only writes the Claude wrapper; Codex setup is currently
-manual. Three pieces, each optional and degrades gracefully:
+manual. Four pieces — the first three are required for routing to work at
+all, the fourth (pid index) is an optional precision upgrade:
 
 **1. Bash wrapper** for tmux sessioning, in `~/.bashrc`:
 
@@ -55,13 +56,14 @@ manual. Three pieces, each optional and degrades gracefully:
 codex() {
     if [ -n "$TMUX" ]; then command codex "$@"; return; fi
     case "${1:-}" in exec) command codex "$@"; return ;; esac
-    local root base tty_id name
+    local root base tty_dev tty_id name
     if root=$(git rev-parse --show-toplevel 2>/dev/null); then
         base="$(basename "$root")"
     else
         base="$(basename "$PWD")"
     fi
-    tty_id="${$(tty 2>/dev/null)#/dev/}"; tty_id="${tty_id//\//-}"
+    tty_dev=$(tty 2>/dev/null)
+    tty_id="${tty_dev#/dev/}"; tty_id="${tty_id//\//-}"
     name="codex-${base}-${tty_id}"; name="${name//./-}"
     if tmux has-session -t "$name" 2>/dev/null; then tmux attach -t "$name"; return; fi
     tmux new-session -s "$name" -- codex "$@"
