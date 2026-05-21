@@ -131,6 +131,45 @@ fn is_likely_default_branch(head_branch: &str) -> bool {
     matches!(head_branch, "main" | "master" | "trunk")
 }
 
+/// True when `body` carries an explicit mention of *any* registered agent.
+///
+/// Two trigger shapes per agent (defined in `agent::Agent::mention_triggers`):
+///   * `@`-mentions match anywhere in the body via `contains`
+///     (`@claude`, `@claude-cr`, `@codex`, `@codex-cr`).
+///   * `/`-slash triggers match only at the start of a (whitespace-stripped)
+///     line so a casual mention of `/claude` inside prose doesn't fire
+///     (`/claude`, `/codex`).
+///
+/// This stage is intentionally agent-permissive: a `@codex` mention on a
+/// Claude-only repo still forwards from classify, and the agent-target
+/// mismatch is filtered later at session-resolution time (sub-issue #29).
+/// Keeping the two stages decoupled means classify stays a pure function
+/// of the payload and doesn't need session-resolution context.
+fn mentions_any_agent(body: &str) -> bool {
+    for agent in crate::agent::Agent::all() {
+        for trigger in agent.mention_triggers {
+            if let Some(rest) = trigger.strip_prefix('/') {
+                // Slash trigger — line-start match. `rest` is the verb
+                // without the leading `/`, but we want the full `/verb`
+                // string for the prefix check so a username starting with
+                // the verb can't trip it (e.g. `claude-cr` shouldn't
+                // satisfy `/claude`).
+                let full = format!("/{rest}");
+                if body
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(full.as_str()))
+                {
+                    return true;
+                }
+            } else if body.contains(trigger) {
+                // `@`-mention — substring anywhere in the body.
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Concrete next-step instruction appended to the `ci-success` / `ci-failure`
 /// wake. Without it sessions idle after a fix-push ("maybe Copilot will
 /// re-review?") or diagnose-and-stop on failures ("it's pre-existing,
@@ -407,15 +446,22 @@ pub fn classify(event_type: &str, payload: &Value, repo: &str, own_logins: &[Str
                 .pointer("/comment/body")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            // Wake only when explicitly addressed: @claude-cr mention or a
-            // /claude slash-command on its own line. Otherwise normal issue
-            // chat would wake the session every few seconds on busy repos.
-            let mentioned = body.contains("@claude-cr")
-                || body.contains("@claude")
-                || body.lines().any(|l| l.trim_start().starts_with("/claude"));
-            if !mentioned {
+            // Wake only when the comment explicitly addresses an agent —
+            // an `@`-mention anywhere in the body, or a `/`-slash trigger
+            // on its own line. Otherwise normal issue chat would wake the
+            // session every few seconds on busy repos.
+            //
+            // Triggers come from every registered agent's `mention_triggers`
+            // list (`@claude`, `@claude-cr`, `/claude` for Claude;
+            // `@codex`, `@codex-cr`, `/codex` for Codex). A `@codex` mention
+            // on a repo with only a Claude session still forwards at this
+            // stage; sub-issue #29 will tighten the routing so the wake
+            // drops at session-resolution time when the trigger doesn't
+            // match the resolved session's agent (i.e. Claude sessions
+            // ignore `@codex`-only mentions and vice versa).
+            if !mentions_any_agent(body) {
                 return Decision::Drop {
-                    reason: "issue_comment without @claude / /claude trigger",
+                    reason: "issue_comment without agent mention",
                 };
             }
             let n = payload
@@ -1433,6 +1479,61 @@ mod tests {
             classify("issue_comment", &payload, "x", &[]),
             Decision::Forward { .. }
         ));
+    }
+
+    #[test]
+    fn issue_comment_with_at_codex_is_forwarded() {
+        // Mirror of the @claude-cr test. Codex's mention triggers must
+        // wake their agent just like Claude's do; agent-target mismatch
+        // (e.g. @codex on a Claude-only repo) is filtered later at
+        // session-resolution time per sub-issue #29 — classify itself is
+        // agent-permissive.
+        let payload = json!({
+            "action": "created",
+            "comment": {"body": "Hey @codex please look at this", "user": {"login": "alice"}},
+            "issue": {"number": 5},
+        });
+        assert!(matches!(
+            classify("issue_comment", &payload, "x", &[]),
+            Decision::Forward { .. }
+        ));
+    }
+
+    #[test]
+    fn issue_comment_with_slash_codex_is_forwarded() {
+        let payload = json!({
+            "action": "created",
+            "comment": {"body": "/codex do the thing", "user": {"login": "alice"}},
+            "issue": {"number": 5},
+        });
+        assert!(matches!(
+            classify("issue_comment", &payload, "x", &[]),
+            Decision::Forward { .. }
+        ));
+    }
+
+    #[test]
+    fn mentions_any_agent_distinguishes_slash_from_prose_mention() {
+        // The slash check is line-prefix, not contains: a casual mention
+        // of "see /claude later" inside prose must NOT count as a wake
+        // trigger. Only a line that *starts with* the slash command is a
+        // trigger. The @-mention rule is different — it matches anywhere
+        // — and that asymmetry is intentional (slash commands look like
+        // shell input, @-mentions look like addressing).
+        assert!(!mentions_any_agent("see /claude later in the docs"));
+        assert!(mentions_any_agent("/claude please do the thing"));
+        assert!(mentions_any_agent(
+            "First line.\n/codex review this please\nThird line."
+        ));
+    }
+
+    #[test]
+    fn mentions_any_agent_returns_false_without_any_trigger() {
+        // Negative guard: plain prose with no `@` or `/` must drop, so
+        // ordinary issue-comment chat doesn't wake either agent on busy
+        // repos.
+        assert!(!mentions_any_agent("Just a regular comment, no mentions."));
+        assert!(!mentions_any_agent(""));
     }
 
     // ---- compute_ci_aggregate ----
