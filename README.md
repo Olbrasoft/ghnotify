@@ -1,10 +1,12 @@
 # ghnotify
 
-Cross-platform single-binary GitHub webhook → Claude Code session forwarder.
+Cross-platform single-binary GitHub webhook → agent-session forwarder.
+Supports both **Claude Code** and **Codex** sessions running side-by-side.
 
 When a GitHub webhook arrives (CI complete, code review done, deploy result, etc.),
-ghnotify delivers a prompt directly into the Claude Code session running for that
-repo, via `tmux send-keys`. No MCP channels, no kernel hacks, no per-session flags.
+ghnotify delivers a prompt directly into the agent session that owns the PR —
+Claude or Codex — via `tmux send-keys`. No MCP channels, no kernel hacks, no
+per-session flags.
 
 ## Why
 
@@ -36,13 +38,72 @@ The wrapper makes every `claude` invocation land inside a tmux session named
 webhook events. Open a new terminal (or `source ~/.bashrc`) for it to take
 effect.
 
+## Codex setup (optional)
+
+ghnotify also routes wakes into Codex sessions. The conventions mirror
+Claude's: tmux session names start with `codex-`, PR bodies carry a
+`<!-- codex-session: $UUID -->` marker, and a pid-index file under
+`~/.codex/sessions/pids/<pid>.json` enables tier-1 (pid-walk) routing
+alongside tier-2 (cwd-basename) fallback.
+
+`ghnotify install` only writes the Claude wrapper; Codex setup is currently
+manual. Three pieces, each optional and degrades gracefully:
+
+**1. Bash wrapper** for tmux sessioning, in `~/.bashrc`:
+
+```bash
+codex() {
+    if [ -n "$TMUX" ]; then command codex "$@"; return; fi
+    case "${1:-}" in exec) command codex "$@"; return ;; esac
+    local root base tty_id name
+    if root=$(git rev-parse --show-toplevel 2>/dev/null); then
+        base="$(basename "$root")"
+    else
+        base="$(basename "$PWD")"
+    fi
+    tty_id="${$(tty 2>/dev/null)#/dev/}"; tty_id="${tty_id//\//-}"
+    name="codex-${base}-${tty_id}"; name="${name//./-}"
+    if tmux has-session -t "$name" 2>/dev/null; then tmux attach -t "$name"; return; fi
+    tmux new-session -s "$name" -- codex "$@"
+}
+```
+
+**2. PR marker convention** — instruct Codex (in `~/.codex/AGENTS.md`) that
+every `gh pr create` MUST start the PR body with:
+
+```
+<!-- codex-session: $SESSION_ID -->
+```
+
+where `$SESSION_ID` is the current Codex session id (the `payload.id` from the
+session's `rollout-*.jsonl`). Without the marker, ghnotify falls back to repo-
+prefix routing, which works fine for Codex-only repos but can misroute when a
+Codex session in repo A opens a PR on repo B.
+
+**3. Helper script** at `~/.codex/get-session-id.sh` that emits the current
+session id on stdout. The recommended approach: walk up the parent process
+tree to find the `codex` pid, then pick the most-recently-modified file
+matching `~/.codex/sessions/*/*/*/rollout-*-<uuid>.jsonl` for that process's
+cwd-basename, extracting the UUID from the filename. Mirror of
+`~/.claude/hooks/get-session-id.sh`.
+
+**4. Pid index (tier-1 routing)** — optional but recommended. ghnotify reads
+`~/.codex/sessions/pids/<pid>.json` (same shape as
+`~/.claude/sessions/<pid>.json`: `{"pid":N,"sessionId":"...","cwd":"..."}`) to
+disambiguate two Codex sessions sharing a cwd. The simplest way to keep it
+fresh is from your Codex `notify` callback (`~/.codex/codex-notify.sh`) on
+agent-turn-complete; the JSON arg carries `thread-id` (sessionId) and `cwd`,
+and `$PPID` is the Codex CLI process. Without the pid index, ghnotify falls
+back to tier-2 (cwd-basename of the rollout JSONL's `session_meta.payload.cwd`)
+— ambiguous only when two Codex sessions share a cwd.
+
 ## Use
 
 ### Verify the setup
 
 ```bash
 ghnotify doctor
-ghnotify list   # shows all claude-* tmux sessions
+ghnotify list   # shows all claude-* and codex-* tmux sessions
 ```
 
 ### Send a one-shot prompt
