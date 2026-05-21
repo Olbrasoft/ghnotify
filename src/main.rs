@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod agent;
 mod config;
 mod event;
 mod gh_lookup;
