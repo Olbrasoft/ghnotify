@@ -470,22 +470,52 @@ fn walk_for_suffix(root: &Path, suffix: &str, max_depth: usize) -> Result<Option
 }
 
 /// Read the first record of a Codex rollout JSONL and extract
-/// `payload.cwd` from the `session_meta` event. The Codex rollout
-/// schema puts the session metadata as the very first line; we still
-/// scan up to 5 lines as a safety net in case a future schema change
-/// reorders.
+/// `payload.cwd` from the `session_meta` event.
+///
+/// **Strict on schema, loud on corruption.** The Codex rollout schema
+/// puts the `session_meta` record as the very first line, every time.
+/// We allow up to 5 lines of look-ahead to tolerate a future format
+/// where leading metadata gets reordered, but the rules are:
+///
+/// - The first non-empty line MUST parse as JSON. If it doesn't, the
+///   file is corrupt and we return `Err` — silently dropping a malformed
+///   rollout would misroute the wake into the cwd-basename fallback or
+///   an unrelated session.
+/// - Subsequent lines can fail to parse without error (file truncation
+///   in the tail is normal; we're only after the head).
+/// - When a `session_meta` record is found, its `payload.cwd` MUST be
+///   a non-empty string. A present-but-malformed record is a schema
+///   break worth surfacing.
+/// - If no `session_meta` shows up in the first MAX_LINES, return
+///   `Ok(None)`: the file existed but didn't carry the cwd we needed.
+///   The caller treats this as a soft miss (tier-2 falls through to
+///   the agent-agnostic repo route).
 fn read_cwd_from_codex_jsonl(path: &Path) -> Result<Option<PathBuf>> {
     const MAX_LINES: usize = 5;
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let reader = BufReader::new(file);
+    let mut first_content_line = true;
     for (i, line) in reader.lines().enumerate() {
         if i >= MAX_LINES {
             break;
         }
         let Ok(line) = line else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+        if line.trim().is_empty() {
             continue;
+        }
+        let v = match serde_json::from_str::<Value>(&line) {
+            Ok(v) => v,
+            Err(e) if first_content_line => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "codex rollout JSONL has unparseable first line: {}",
+                        path.display()
+                    )
+                });
+            }
+            Err(_) => continue,
         };
+        first_content_line = false;
         // Codex schema: top-level `type == "session_meta"`, the cwd lives
         // under `payload.cwd`. The check on `type` keeps us from
         // accidentally matching a future event variant that reuses the
@@ -493,12 +523,15 @@ fn read_cwd_from_codex_jsonl(path: &Path) -> Result<Option<PathBuf>> {
         if v.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
-        if let Some(cwd) = v
-            .pointer("/payload/cwd")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            return Ok(Some(PathBuf::from(cwd)));
+        let cwd = v.pointer("/payload/cwd").and_then(Value::as_str);
+        match cwd {
+            Some(s) if !s.is_empty() => return Ok(Some(PathBuf::from(s))),
+            _ => {
+                return Err(anyhow!(
+                    "codex rollout JSONL has session_meta with missing/empty payload.cwd: {}",
+                    path.display()
+                ));
+            }
         }
     }
     Ok(None)
@@ -687,21 +720,87 @@ mod tests {
     }
 
     #[test]
-    fn codex_jsonl_ignores_empty_payload_cwd() {
-        // Mirror of the Claude `ignores_empty_cwd` test for the Codex
-        // shape. An empty string must not be returned as a valid cwd.
+    fn codex_jsonl_empty_payload_cwd_is_an_error() {
+        // session_meta is the contract: its cwd field is supposed to be a
+        // non-empty path. An empty-string cwd would otherwise be returned
+        // as `Some(PathBuf::from(""))` and the downstream basename routine
+        // would fall over silently. Treat it as a schema break — loud
+        // failure beats silent misroute.
+        let tmp = tempdir();
+        let path = write_jsonl(&tmp, &[r#"{"type":"session_meta","payload":{"cwd":""}}"#]);
+        let err = read_cwd_from_codex_jsonl(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("missing/empty payload.cwd"),
+            "expected schema-break error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_session_meta_without_payload_cwd_is_an_error() {
+        // Same loud-failure path: a session_meta record that omits cwd
+        // entirely must surface, not silently fall through.
+        let tmp = tempdir();
+        let path = write_jsonl(&tmp, &[r#"{"type":"session_meta","payload":{"id":"x"}}"#]);
+        let err = read_cwd_from_codex_jsonl(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("missing/empty payload.cwd"),
+            "expected schema-break error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_unparseable_first_line_is_an_error() {
+        // A corrupted rollout (truncated write, encoding garble, whatever)
+        // must fail loudly. Silently treating it as "no session_meta found"
+        // would push the resolver into the cwd-basename fallback against
+        // a file that *should* have answered authoritatively.
+        let tmp = tempdir();
+        let path = write_jsonl(&tmp, &["not valid json at all"]);
+        let err = read_cwd_from_codex_jsonl(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unparseable first line"),
+            "expected unparseable-line error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_unparseable_tail_line_is_tolerated() {
+        // File corruption in the tail (after a valid session_meta) is
+        // routine — Codex appends without fsync between events. The
+        // session_meta we care about is the FIRST record, so a broken
+        // line later doesn't change what we can answer.
         let tmp = tempdir();
         let path = write_jsonl(
             &tmp,
             &[
-                r#"{"type":"session_meta","payload":{"cwd":""}}"#,
-                r#"{"type":"session_meta","payload":{"cwd":"/home/jirka/imdb"}}"#,
+                r#"{"type":"session_meta","payload":{"cwd":"/home/jirka/cr"}}"#,
+                "garbage line",
+                r#"{"type":"user_input"}"#,
             ],
         );
         assert_eq!(
             read_cwd_from_codex_jsonl(&path).unwrap(),
-            Some(PathBuf::from("/home/jirka/imdb"))
+            Some(PathBuf::from("/home/jirka/cr"))
         );
+    }
+
+    #[test]
+    fn codex_jsonl_returns_none_when_no_session_meta_in_window() {
+        // The file is valid JSON throughout but doesn't carry a
+        // session_meta in the look-ahead window. That's a "soft miss" —
+        // tier-2 falls through gracefully, no error. Important: this is
+        // different from a corrupted first line (which is an error)
+        // because here every line was well-formed; the rollout schema
+        // just didn't yield the answer we wanted.
+        let tmp = tempdir();
+        let path = write_jsonl(
+            &tmp,
+            &[
+                r#"{"type":"user_input"}"#,
+                r#"{"type":"shell_call","payload":{}}"#,
+            ],
+        );
+        assert_eq!(read_cwd_from_codex_jsonl(&path).unwrap(), None);
     }
 
     // -- rollout walker --------------------------------------------------
