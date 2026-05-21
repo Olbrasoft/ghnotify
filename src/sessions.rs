@@ -122,16 +122,18 @@ pub fn resolve_session_for_repo(repo: &str, agent: &Agent) -> Result<Option<Stri
 }
 
 /// Agent-agnostic counterpart to [`resolve_session_for_repo`]. Considers
-/// candidates from *every* registered agent for the same repo and picks the
-/// best one by the standard attached → newest rule.
+/// candidates from *every* registered agent for the same repo and picks
+/// the best one by the standard rule: **prefer attached sessions over
+/// detached ones; among ties, the session with the higher `session_created`
+/// timestamp wins**. tmux doesn't expose a "last activity" timestamp, so
+/// creation time is our recency proxy — newer sessions tend to be the
+/// ones the user just opened and is actively working in.
 ///
-/// This is the routing path for webhooks that arrive **without** a PR marker
-/// — there's no signal telling us which agent the wake belongs to, so the
-/// recency rule decides. When only one agent has a session for the repo (the
-/// common case), the result is identical to calling [`resolve_session_for_repo`]
-/// with that agent. When both Claude and Codex have a session for the repo,
-/// the more recently attached one wins, which preserves "current focus"
-/// semantics that the user actually has on screen.
+/// This is the routing path for webhooks that arrive **without** a PR
+/// marker — there's no signal telling us which agent the wake belongs to,
+/// so the rule above decides. When only one agent has a session for the
+/// repo (the common case), the result is identical to calling
+/// [`resolve_session_for_repo`] with that agent.
 pub fn resolve_session_for_repo_any(repo: &str) -> Result<Option<String>> {
     let sessions = list_agent_sessions_full()?;
     Ok(pick_session_any(&sessions, repo))
@@ -250,10 +252,10 @@ pub fn doctor() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Test helper. Builds a Claude-owned SessionInfo by default; the agent
-    /// kind is inferred from the name's prefix so test inputs stay terse.
-    /// For tests that need to mix Claude and Codex sessions in one input,
-    /// prefer using [`s_kind`] explicitly.
+    /// Test helper. Infers the agent kind from the session name's prefix
+    /// so test inputs stay terse — `s("claude-cr", …)` and
+    /// `s("codex-cr", …)` both produce correctly-tagged `SessionInfo`s
+    /// without the call sites having to spell out `AgentKind` literals.
     fn s(name: &str, attached: bool, created: u64) -> SessionInfo {
         let kind = Agent::from_tmux_session_name(name)
             .map(|a| a.kind)

@@ -1,5 +1,6 @@
 //! HTTP webhook receiver. Accepts GitHub-style JSON webhooks at `POST /webhook`,
-//! resolves the target Claude session, and dispatches a prompt via tmux.
+//! resolves the target agent (Claude or Codex) session, and dispatches a
+//! prompt via tmux.
 //!
 //! GitHub event payload shape (subset we care about):
 //!   { "repository": { "name": "GitHub.Issues", "full_name": "Olbrasoft/GitHub.Issues" }, ... }
@@ -36,11 +37,14 @@
 //!      do with the PR. All calls are gated on a short timeout so a
 //!      stuck `gh` (auth prompt, network stall) can't jam the
 //!      webhook handler.
-//!   3. **By repo name** — fall back to the prefix match on
-//!      `claude-<repo>` when the marker is absent, the session is
-//!      dead, or any of the lookups above fail. Preserves legacy
-//!      behavior for non-PR events (`ping`, `issues assigned`) and
-//!      for PRs created before the marker convention existed.
+//!   3. **By repo name (agent-agnostic)** — fall back to the prefix
+//!      match across *every* registered agent (`claude-<repo>` and
+//!      `codex-<repo>`) when the marker is absent, the session is
+//!      dead, or any of the lookups above fail. Among matching
+//!      sessions, attached beats detached and the higher
+//!      `session_created` timestamp breaks ties. Preserves legacy
+//!      behavior for non-PR events (`ping`, `issues assigned`) and for
+//!      PRs created before the marker convention existed.
 //!
 //! Runs in two modes:
 //!   * persistent — binds an address and serves forever (`ghnotify serve`)
@@ -48,7 +52,9 @@
 //!     intended to be run per-connection under systemd socket activation so
 //!     nothing is running between webhook deliveries.
 
-use crate::{config::Config, event, gh_lookup, session_by_uuid, session_marker, sessions, tmux};
+use crate::{
+    agent::Agent, config::Config, event, gh_lookup, session_by_uuid, session_marker, sessions, tmux,
+};
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
@@ -264,26 +270,32 @@ async fn process_webhook(
     //    repo-prefix fallback (legacy behavior for events we can't
     //    attribute to a specific author session).
     //
-    // The `base` here is used only for the "not found" log message below;
-    // it shows the Claude name shape the user would expect to see. Sub-issue
-    // #29 makes this log line agent-aware (it currently still names just
-    // `claude-…` in the not-found message).
-    let base = tmux::session_name_for_repo(repo_name, crate::agent::Agent::claude());
+    // The candidates string here is used only for the "not found" log
+    // message below. Now that the repo fallback is agent-agnostic, we
+    // list both candidate session-name shapes so an operator debugging
+    // a missed wake sees the actual names ghnotify looked for —
+    // Codex-only setups would otherwise see a `claude-…` hint and chase
+    // the wrong prefix.
+    let candidates = Agent::all()
+        .iter()
+        .map(|a| tmux::session_name_for_repo(repo_name, a))
+        .collect::<Vec<_>>()
+        .join(" or ");
     let (session, via) = match resolve_target_session(event_type, &payload, repo_name).await {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
             info!(
-                base,
+                candidates,
                 event_type,
-                "no claude session found (neither author UUID nor repo), event discarded"
+                "no agent session found (neither author UUID nor repo), event discarded"
             );
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
                     "discarded": true,
-                    "reason": "no matching claude session",
-                    "session": base,
+                    "reason": "no matching agent session",
+                    "candidates": candidates,
                 })),
             );
         }
@@ -367,11 +379,13 @@ async fn resolve_target_session(
     // issues) and as a safety net when the author session is dead.
     //
     // Agent-agnostic resolution: when no marker is available, consider
-    // every agent's sessions for the repo and let recency decide which one
-    // wins. With Claude-only setups this is functionally identical to the
-    // pre-refactor behavior (only Claude sessions exist, so they win
-    // trivially); with Codex sessions present, the most-recently-active
-    // session is preferred regardless of agent.
+    // every agent's sessions for the repo. Selection follows the standard
+    // rule documented on `pick_session_any` — attached sessions beat
+    // detached ones; among ties, the session with the higher
+    // `session_created` timestamp wins (tmux doesn't expose last-activity
+    // time, so creation time is the recency proxy). With Claude-only
+    // setups this is functionally identical to the pre-refactor behavior:
+    // only Claude sessions exist, so they win trivially.
     match sessions::resolve_session_for_repo_any(repo_name)? {
         Some(name) => Ok(Some((name, "repo"))),
         None => Ok(None),
